@@ -1,0 +1,745 @@
+package io.tolgee.service.key
+
+import io.tolgee.activity.ActivityHolder
+import io.tolgee.component.CurrentDateProvider
+import io.tolgee.constants.Message
+import io.tolgee.dtos.KeyImportResolvableResult
+import io.tolgee.dtos.cacheable.ProjectDto
+import io.tolgee.dtos.queryResults.KeyView
+import io.tolgee.dtos.queryResults.keyDisabledLanguages.KeyDisabledLanguagesView
+import io.tolgee.dtos.request.GetKeysRequestDto
+import io.tolgee.dtos.request.key.CreateKeyDto
+import io.tolgee.dtos.request.key.EditKeyDto
+import io.tolgee.dtos.request.translation.ImportKeysItemDto
+import io.tolgee.dtos.request.translation.importKeysResolvable.ImportKeysResolvableItemDto
+import io.tolgee.dtos.request.validators.exceptions.ValidationException
+import io.tolgee.exceptions.BadRequestException
+import io.tolgee.exceptions.NotFoundException
+import io.tolgee.model.Language
+import io.tolgee.model.Project
+import io.tolgee.model.Screenshot
+import io.tolgee.model.UserAccount
+import io.tolgee.model.enums.TranslationState
+import io.tolgee.model.key.Key
+import io.tolgee.model.translation.Translation
+import io.tolgee.repository.KeyRepository
+import io.tolgee.repository.LanguageRepository
+import io.tolgee.repository.TaskKeyRepository
+import io.tolgee.security.authentication.AuthenticationFacade
+import io.tolgee.service.AiPlaygroundResultService
+import io.tolgee.service.bigMeta.BigMetaService
+import io.tolgee.service.branching.BranchMergeService
+import io.tolgee.service.branching.BranchService
+import io.tolgee.service.key.utils.KeyInfoProvider
+import io.tolgee.service.key.utils.KeysImporter
+import io.tolgee.service.security.SecurityService
+import io.tolgee.service.translation.TranslationService
+import io.tolgee.service.translation.TranslationSuggestionService
+import io.tolgee.service.translation.applyMaxCharLimit
+import io.tolgee.service.translation.validateCharLimit
+import io.tolgee.util.Logging
+import io.tolgee.util.setSimilarityLimit
+import jakarta.persistence.EntityManager
+import org.springframework.context.ApplicationContext
+import org.springframework.context.annotation.Lazy
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.PageRequest
+import org.springframework.data.domain.Pageable
+import org.springframework.data.repository.findByIdOrNull
+import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Transactional
+import java.util.Date
+import java.util.Optional
+
+@Service
+class KeyService(
+  private val keyRepository: KeyRepository,
+  private val screenshotService: ScreenshotService,
+  private val keyMetaService: KeyMetaService,
+  private val tagService: TagService,
+  private val namespaceService: NamespaceService,
+  private val applicationContext: ApplicationContext,
+  private val entityManager: EntityManager,
+  @Lazy
+  private var translationService: TranslationService,
+  private val languageRepository: LanguageRepository,
+  private val bigMetaService: BigMetaService,
+  private val activityHolder: ActivityHolder,
+  @Lazy
+  private val aiPlaygroundResultService: AiPlaygroundResultService,
+  private val taskKeyRepository: TaskKeyRepository,
+  @Lazy
+  private val branchService: BranchService,
+  @Lazy
+  private val securityService: SecurityService,
+  @Lazy
+  private val branchMergeService: BranchMergeService,
+  private val currentDateProvider: CurrentDateProvider,
+  private val authenticationFacade: AuthenticationFacade,
+  @Lazy
+  private val translationSuggestionService: TranslationSuggestionService,
+) : Logging {
+  fun getAll(projectId: Long): Set<Key> {
+    return keyRepository.getAllByProjectId(projectId)
+  }
+
+  fun getAllByBranch(
+    projectId: Long,
+    branch: String?,
+  ): Set<Key> {
+    return keyRepository.getAllByProjectIdAndBranch(projectId, branch)
+  }
+
+  fun getAllSortedById(
+    projectId: Long,
+    branch: String?,
+  ): List<KeyView> {
+    branchService.getActiveOrDefault(projectId, branch)
+    return keyRepository.getAllByProjectIdSortedById(projectId, branch)
+  }
+
+  fun get(
+    projectId: Long,
+    name: String,
+    namespace: String?,
+    branchName: String? = null,
+  ): Key {
+    return keyRepository
+      .getByNameAndNamespace(projectId, name, namespace, branchName)
+      .orElseThrow { NotFoundException(Message.KEY_NOT_FOUND) }!!
+  }
+
+  fun find(
+    projectId: Long,
+    name: String,
+    namespace: String?,
+    branch: String? = null,
+  ): Key? {
+    return this.findOptional(projectId, name, namespace, branch).orElseGet { null }
+  }
+
+  private fun findOptional(
+    projectId: Long,
+    name: String,
+    namespace: String?,
+    branch: String?,
+  ): Optional<Key> {
+    return keyRepository.getByNameAndNamespace(projectId, name, namespace, branch)
+  }
+
+  fun get(id: Long): Key {
+    return keyRepository.findByIdOrNull(id) ?: throw NotFoundException(Message.KEY_NOT_FOUND)
+  }
+
+  fun get(
+    projectId: Long,
+    id: Long,
+  ): Key {
+    val key = get(id)
+    if (key.project.id != projectId) {
+      throw NotFoundException(Message.KEY_NOT_FOUND)
+    }
+    return key
+  }
+
+  fun getView(
+    projectId: Long,
+    id: Long,
+  ): KeyView {
+    return keyRepository.findView(projectId, id) ?: throw NotFoundException(Message.KEY_NOT_FOUND)
+  }
+
+  fun find(id: Long): Key? {
+    return keyRepository.findById(id).orElse(null)
+  }
+
+  fun findOptional(id: Long): Optional<Key> {
+    return keyRepository.findById(id)
+  }
+
+  fun findAllWithProjectsAndMetas(ids: Set<Long>): List<Key> {
+    return keyRepository.findWithProjectsAndMetas(ids)
+  }
+
+  fun save(key: Key): Key {
+    keyRepository.save(key)
+    return key
+  }
+
+  @Transactional
+  fun create(
+    project: Project,
+    dto: CreateKeyDto,
+  ): Key {
+    val key = create(project, dto.name, dto.namespace, dto.branch)
+    key.isPlural = dto.isPlural
+    if (key.isPlural) {
+      key.pluralArgName = dto.pluralArgName
+    }
+    key.maxCharLimit = dto.maxCharLimit
+
+    if (!dto.translations.isNullOrEmpty()) {
+      validateCharLimit(key, dto.translations!!)
+    }
+
+    val created = createTranslationsOnKeyCreate(dto, key)
+
+    dto.states
+      ?.map {
+        val translation =
+          created?.get(it.key)
+            ?: throw BadRequestException(Message.CANNOT_SET_STATE_FOR_MISSING_TRANSLATION)
+        translation to it.value.translationState
+      }?.toMap()
+      ?.let { translationService.setStateBatch(it) }
+
+    keyMetaService.getOrCreateForKey(key).apply {
+      description = dto.description
+    }
+
+    dto.tags?.forEach {
+      activityHolder.businessEventData["usesTags"] = "true"
+      tagService.tagKey(key, it)
+    }
+
+    bigMetaService.store(dto.relatedKeysInOrder, project, key.id)
+
+    storeScreenshots(dto, key)
+
+    return key
+  }
+
+  private fun createTranslationsOnKeyCreate(
+    dto: CreateKeyDto,
+    key: Key,
+  ): Map<String, Translation>? {
+    if (dto.translations.isNullOrEmpty()) {
+      return null
+    }
+    return translationService.setForKey(key, dto.translations!!)
+  }
+
+  private fun storeScreenshots(
+    dto: CreateKeyDto,
+    key: Key,
+  ) {
+    @Suppress("DEPRECATION")
+    val screenshotUploadedImageIds = dto.screenshotUploadedImageIds
+    val screenshots = dto.screenshots
+
+    if (!screenshotUploadedImageIds.isNullOrEmpty() && !dto.screenshots.isNullOrEmpty()) {
+      throw BadRequestException(Message.PROVIDE_ONLY_ONE_OF_SCREENSHOTS_AND_SCREENSHOT_UPLOADED_IMAGE_IDS)
+    }
+
+    if (!screenshotUploadedImageIds.isNullOrEmpty()) {
+      screenshotService.saveUploadedImages(screenshotUploadedImageIds, key)
+      return
+    }
+
+    if (!screenshots.isNullOrEmpty()) {
+      screenshotService.saveUploadedImages(screenshots, key)
+      return
+    }
+  }
+
+  @Transactional
+  fun create(
+    project: Project,
+    name: String,
+    namespace: String?,
+    branch: String? = null,
+    isPlural: Boolean = false,
+  ): Key {
+    checkKeyNotExisting(projectId = project.id, name = name, namespace = namespace, branch = branch)
+    return createWithoutExistenceCheck(project, name, namespace, branch, isPlural)
+  }
+
+  @Transactional
+  fun createWithoutExistenceCheck(
+    project: Project,
+    name: String,
+    namespace: String?,
+    branch: String?,
+    isPlural: Boolean,
+  ): Key {
+    val key = Key(name = name, project = project).apply { this.isPlural = isPlural }
+    if (!namespace.isNullOrBlank()) {
+      key.namespace = namespaceService.findOrCreate(namespace, project.id)
+    }
+    key.branch = branchService.getActiveOrDefault(project.id, branch)
+    return save(key)
+  }
+
+  @Transactional
+  fun edit(
+    keyId: Long,
+    dto: EditKeyDto,
+  ): Key {
+    val key = findOptional(keyId).orElseThrow { NotFoundException() }
+    securityService.checkBranchModify(key)
+    keyMetaService.getOrCreateForKey(key).apply {
+      description = dto.description
+    }
+    key.applyMaxCharLimit(dto.maxCharLimit)
+    return edit(key, dto.name, dto.namespace, dto.branch)
+  }
+
+  fun edit(
+    key: Key,
+    newName: String,
+    newNamespace: String?,
+    branch: String?,
+  ): Key {
+    if (key.name == newName && key.namespace?.name == newNamespace) {
+      return key
+    }
+
+    checkKeyNotExisting(key.project.id, newName, newNamespace, branch)
+
+    key.name = newName
+
+    val oldNamespace = key.namespace
+    val namespaceModified = key.namespace?.name != newNamespace
+    if (namespaceModified) {
+      key.namespace = namespaceService.findOrCreate(newNamespace, key.project.id)
+    }
+
+    save(key)
+
+    if (namespaceModified && oldNamespace != null) {
+      namespaceService.deleteIfUnused(oldNamespace)
+    }
+
+    return key
+  }
+
+  @Transactional
+  fun setNamespace(
+    keyIds: List<Long>,
+    namespace: String?,
+  ) {
+    val keys = keyRepository.getKeysWithNamespaces(keyIds)
+    val projectId = keys.map { it.project.id }.distinct().singleOrNull() ?: return
+    val namespaceEntity = namespaceService.findOrCreate(namespace, projectId)
+
+    val oldNamespaces =
+      keys.map {
+        val oldNamespace = it.namespace
+        it.namespace = namespaceEntity
+        oldNamespace
+      }
+
+    val modifiedNamespaces =
+      oldNamespaces
+        .filter { it?.name != namespace }
+        .filterNotNull()
+        .distinctBy { it.id }
+
+    namespaceService.deleteIfUnused(modifiedNamespaces)
+    keyRepository.saveAll(keys)
+  }
+
+  fun checkKeyNotExisting(
+    projectId: Long,
+    name: String,
+    namespace: String?,
+    branch: String?,
+  ) {
+    if (findOptional(projectId, name, namespace, branch).isPresent) {
+      throw ValidationException(Message.KEY_EXISTS)
+    }
+  }
+
+  @Transactional
+  fun hardDelete(id: Long) {
+    val key = findOptional(id).orElseThrow { NotFoundException() }
+    val namespace = key.namespace
+    translationService.deleteAllByKey(id)
+    keyMetaService.deleteAllByKeyId(id)
+    screenshotService.deleteAllByKeyId(id)
+    taskKeyRepository.deleteAllByKeyIdIn(listOf(id))
+    branchMergeService.deleteChangesByKeyIds(listOf(id))
+    translationSuggestionService.deleteAllByKeyIds(listOf(id))
+    // Flush and clear the persistence context to ensure deletions are synchronized
+    // and to prevent Hibernate 6.6's CHECK_ON_FLUSH from seeing stale relationships
+    entityManager.flush()
+    entityManager.clear()
+    // Re-fetch the key after clearing the persistence context
+    val keyToDelete = keyRepository.findById(id).orElseThrow { NotFoundException() }
+    keyRepository.delete(keyToDelete)
+    namespaceService.deleteIfUnused(namespace)
+    aiPlaygroundResultService.deleteResultsByKeys(listOf(id))
+  }
+
+  @Transactional
+  fun softDeleteMultiple(
+    ids: Collection<Long>,
+    deletedBy: UserAccount? = null,
+  ) {
+    val actualDeletedBy = deletedBy ?: authenticationFacade.authenticatedUserEntityOrNull
+    val now = currentDateProvider.date
+    ids.chunked(SOFT_DELETE_CHUNK_SIZE).forEach { chunk ->
+      val keys = keyRepository.findAllByIdIn(chunk)
+      keys.forEach {
+        it.deletedAt = now
+        it.deletedBy = actualDeletedBy
+      }
+      keyRepository.saveAll(keys)
+    }
+  }
+
+  @Transactional
+  fun restoreKeys(
+    ids: Collection<Long>,
+    projectId: Long,
+  ) {
+    val keys = keyRepository.findSoftDeletedByIdsAndProjectId(ids, projectId)
+    if (keys.isEmpty()) return
+
+    val names = keys.map { it.name }.toSet()
+    val activeKeysWithSameNames = keyRepository.findActiveByProjectIdAndNames(projectId, names)
+    val activeKeyIdentifiers =
+      activeKeysWithSameNames.map { Triple(it.name, it.namespace?.name, it.branch?.name) }.toSet()
+
+    keys.forEach { key ->
+      val identifier = Triple(key.name, key.namespace?.name, key.branch?.name)
+      if (identifier in activeKeyIdentifiers) {
+        throw ValidationException(Message.KEY_EXISTS, key.name)
+      }
+      key.deletedAt = null
+      key.deletedBy = null
+    }
+    keyRepository.saveAll(keys)
+  }
+
+  @Transactional
+  fun restoreKey(
+    projectId: Long,
+    keyId: Long,
+  ): Key {
+    val key =
+      keyRepository.findSoftDeletedByIdsAndProjectId(listOf(keyId), projectId).firstOrNull()
+        ?: throw NotFoundException(Message.KEY_NOT_FOUND)
+
+    // Check that no active key with the same name+namespace+branch exists
+    val branch = key.branch?.name
+    val existing = find(projectId, key.name, key.namespace?.name, branch)
+    if (existing != null) {
+      throw BadRequestException(Message.KEY_EXISTS)
+    }
+
+    key.deletedAt = null
+    key.deletedBy = null
+    return save(key)
+  }
+
+  @Transactional
+  fun hardDeleteMultiple(ids: Collection<Long>) {
+    traceLogMeasureTime("hard delete multiple keys: delete translations") {
+      translationService.deleteAllByKeys(ids)
+    }
+
+    traceLogMeasureTime("hard delete multiple keys: delete key metas") {
+      keyMetaService.deleteAllByKeyIdIn(ids)
+    }
+
+    traceLogMeasureTime("hard delete multiple keys: delete screenshots") {
+      screenshotService.deleteAllByKeyId(ids)
+    }
+    aiPlaygroundResultService.deleteResultsByKeys(ids)
+
+    traceLogMeasureTime("delete multiple keys: delete task keys") {
+      taskKeyRepository.deleteAllByKeyIdIn(ids)
+    }
+
+    branchMergeService.deleteChangesByKeyIds(ids)
+
+    translationSuggestionService.deleteAllByKeyIds(ids)
+
+    // Flush and clear the persistence context to ensure deletions are synchronized
+    // and to prevent Hibernate 6.6's CHECK_ON_FLUSH from seeing stale relationships
+    entityManager.flush()
+    entityManager.clear()
+
+    val keys =
+      traceLogMeasureTime("hard delete multiple keys: fetch keys") {
+        keyRepository.findAllByIdInForDelete(ids)
+      }
+
+    val namespaces = keys.map { it.namespace }
+
+    traceLogMeasureTime("hard delete multiple keys: delete the keys") {
+      keyRepository.deleteAll(keys)
+    }
+
+    namespaceService.deleteUnusedNamespaces(namespaces)
+  }
+
+  fun getSoftDeletedKeys(
+    projectId: Long,
+    branch: String?,
+    pageable: Pageable,
+  ): Page<KeySearchResultView> {
+    return keyRepository.findSoftDeletedByProjectId(projectId, branch, pageable)
+  }
+
+  fun findSoftDeletedIdsDeletedBeforeAndIdAfter(
+    deletedBefore: Date,
+    afterId: Long,
+    pageable: Pageable,
+  ): List<Long> {
+    return keyRepository.findSoftDeletedIdsDeletedBeforeAndIdAfter(deletedBefore, afterId, pageable)
+  }
+
+  fun findSoftDeletedByIdsAndProjectId(
+    ids: Collection<Long>,
+    projectId: Long,
+  ): List<Key> {
+    return keyRepository.findSoftDeletedByIdsAndProjectId(ids, projectId)
+  }
+
+  fun getSoftDeletedProjectIdsForKeyIds(keyIds: List<Long>): List<Long> {
+    return keyRepository.getSoftDeletedProjectIdsForKeyIds(keyIds)
+  }
+
+  @Transactional
+  fun hardDeleteSingleTrashedKey(
+    projectId: Long,
+    keyId: Long,
+  ) {
+    val projectIds = getSoftDeletedProjectIdsForKeyIds(listOf(keyId))
+    if (projectIds.isEmpty() || projectIds.single() != projectId) {
+      throw NotFoundException(Message.KEY_NOT_FROM_PROJECT)
+    }
+    hardDeleteMultiple(listOf(keyId))
+  }
+
+  fun findDistinctDeleters(
+    projectId: Long,
+    branch: String?,
+  ): List<UserAccount> {
+    return keyRepository.findDistinctDeleters(projectId, branch)
+  }
+
+  @Transactional
+  fun deleteAllByProject(projectId: Long) {
+    keyMetaService.deleteAllByProject(projectId)
+    screenshotService.deleteAllByProject(projectId)
+    taskKeyRepository.deleteAllByKeyProjectId(projectId)
+    branchMergeService.deleteChangesByProjectId(projectId)
+
+    entityManager
+      .createQuery("""delete from Key where project.id = :projectId""")
+      .setParameter("projectId", projectId)
+      .executeUpdate()
+
+    namespaceService.deleteAllByProject(projectId)
+  }
+
+  fun checkInProject(
+    key: Key,
+    projectId: Long,
+  ) {
+    if (key.project.id != projectId) {
+      throw BadRequestException(Message.KEY_NOT_FROM_PROJECT)
+    }
+  }
+
+  fun saveAll(entities: Collection<Key>): MutableList<Key> = entities.map { save(it) }.toMutableList()
+
+  @Transactional
+  fun importKeys(
+    keys: List<ImportKeysItemDto>,
+    project: Project,
+    branch: String?,
+  ) {
+    KeysImporter(applicationContext, keys, project, branch).import()
+  }
+
+  @Transactional
+  fun searchKeys(
+    search: String,
+    languageTag: String?,
+    project: ProjectDto,
+    branch: String?,
+    pageable: Pageable,
+  ): Page<KeySearchResultView> {
+    branchService.getActiveOrDefault(project.id, branch)
+    return searchKeys(search, languageTag, project.id, branch, trashed = false, pageable)
+  }
+
+  @Transactional
+  fun searchKeys(
+    search: String,
+    languageTag: String?,
+    projectId: Long,
+    branch: String?,
+    trashed: Boolean = false,
+    pageable: Pageable,
+  ): Page<KeySearchResultView> {
+    entityManager.setSimilarityLimit(0.00001)
+    // The native query handles ORDER BY internally (relevance-based), so strip
+    // any sort from the pageable to avoid a duplicate ORDER BY clause.
+    val unsortedPageable = PageRequest.of(pageable.pageNumber, pageable.pageSize)
+    return keyRepository.searchKeys(search, projectId, languageTag, branch, trashed, unsortedPageable)
+  }
+
+  @Transactional
+  fun importKeysResolvable(
+    keys: List<ImportKeysResolvableItemDto>,
+    projectEntity: Project,
+    branch: String? = null,
+  ): KeyImportResolvableResult {
+    val importer =
+      ResolvingKeyImporter(
+        applicationContext = applicationContext,
+        keysToImport = keys,
+        projectEntity = projectEntity,
+        branch = branch,
+      )
+    return importer()
+  }
+
+  @Suppress("UNCHECKED_CAST")
+  fun getKeysInfo(
+    dto: GetKeysRequestDto,
+    projectId: Long,
+    branch: String?,
+  ): List<Pair<Key, List<Screenshot>>> {
+    branchService.getActiveOrDefault(projectId, branch)
+    return KeyInfoProvider(applicationContext, projectId, dto, branch).get()
+  }
+
+  fun getPaged(
+    projectId: Long,
+    branch: String?,
+    pageable: Pageable,
+  ): Page<KeyView> = keyRepository.getAllByProjectId(projectId, branch, pageable)
+
+  fun getKeysWithTags(keys: Set<Key>): List<Key> = keyRepository.getWithTags(keys)
+
+  fun getKeysWithTagsById(
+    projectId: Long,
+    keysIds: Iterable<Long>,
+  ): Set<Key> {
+    val result = keyRepository.getWithTagsByIds(projectId, keysIds)
+
+    if (keysIds.count() != result.count()) {
+      throw NotFoundException(Message.KEY_NOT_FOUND)
+    }
+
+    return result
+  }
+
+  fun find(id: Collection<Long>): List<Key> {
+    return keyRepository.findAllByIdIn(id)
+  }
+
+  fun find(
+    projectId: Long,
+    ids: Collection<Long>,
+  ): List<Key> {
+    return keyRepository.findAllByProjectIdAndIdIn(projectId, ids)
+  }
+
+  @Transactional
+  fun getDisabledLanguages(
+    projectId: Long,
+    keyId: Long,
+  ): List<Language> {
+    return keyRepository.getDisabledLanguages(projectId, keyId)
+  }
+
+  @Transactional
+  fun getDisabledLanguages(projectId: Long): List<KeyDisabledLanguagesView> {
+    val queryResult = keyRepository.getDisabledLanguages(projectId)
+    return queryResult
+      .groupBy {
+        it.id
+      }.map {
+        KeyDisabledLanguagesView(
+          it.key,
+          it.value.first().name,
+          it.value.first().namespace,
+          it.value.map { disabledLanguage ->
+            KeyDisabledLanguagesView.KeyDisabledLanguageModel(disabledLanguage.languageId, disabledLanguage.languageTag)
+          },
+        )
+      }
+  }
+
+  @Transactional
+  fun setDisabledLanguages(
+    projectId: Long,
+    keyId: Long,
+    languageIds: List<Long>,
+  ): List<Language> {
+    val key = keyRepository.findByProjectIdAndId(projectId, keyId) ?: throw NotFoundException()
+    securityService.checkBranchModify(key)
+    enableRestOfLanguages(projectId, languageIds, key)
+    return disableLanguages(projectId, languageIds, key)
+  }
+
+  private fun enableRestOfLanguages(
+    projectId: Long,
+    languageIdsToDisable: List<Long>,
+    key: Key,
+  ) {
+    val currentlyDisabledLanguages = keyRepository.getDisabledLanguages(projectId, key.id)
+    val languagesToEnable = currentlyDisabledLanguages.filter { !languageIdsToDisable.contains(it.id) }
+    languagesToEnable.forEach { language ->
+      val translation = translationService.find(key, language).orElse(null) ?: return@forEach
+      translation.clear()
+      translationService.save(translation)
+    }
+  }
+
+  private fun disableLanguages(
+    projectId: Long,
+    languageIds: List<Long>,
+    key: Key,
+  ): List<Language> {
+    val languages = languageRepository.findAllByProjectIdAndIds(projectId, languageIds)
+    languages.forEach { language ->
+      val translation = translationService.getOrCreate(key, language)
+      translation.clear()
+      translation.state = TranslationState.DISABLED
+      translationService.save(translation)
+    }
+    return languages.sortedBy { languageIds.indexOf(it.id) }
+  }
+
+  fun getViewsByKeyIds(ids: List<Long>): List<KeyView> {
+    return keyRepository.getViewsByKeyIds(ids)
+  }
+
+  fun getByIds(ids: Collection<Long>): List<Key> {
+    return ids
+      // limit of postgres in clause size
+      .chunked(32000)
+      .flatMap { keyRepository.findAllByIdIn(it) }
+  }
+
+  fun countAllOnInstance(): Long {
+    return keyRepository.countAllOnInstance()
+  }
+
+  fun resolveKeysByName(
+    projectId: Long,
+    names: List<String>,
+    namespace: String?,
+    branch: String?,
+  ): Pair<List<Key>, List<String>> {
+    val resolved =
+      names.map { name ->
+        name to find(projectId = projectId, name = name, namespace = namespace, branch = branch)
+      }
+    val found = resolved.mapNotNull { it.second }
+    val notFound = resolved.filter { it.second == null }.map { it.first }
+    return found to notFound
+  }
+
+  companion object {
+    private const val SOFT_DELETE_CHUNK_SIZE = 10_000
+  }
+}

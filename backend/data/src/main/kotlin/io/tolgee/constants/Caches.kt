@@ -1,0 +1,27 @@
+package io.tolgee.constants
+
+interface Caches {
+  companion object {
+    const val BUSINESS_EVENT_THROTTLING = "businessEventThrottling"
+    const val USER_ACCOUNTS = "userAccounts"
+    const val PROJECT_API_KEYS = "projectApiKeys"
+    const val PERSONAL_ACCESS_TOKENS = "personalAccessTokens"
+    const val ORGANIZATIONS = "organizations"
+    const val PROJECTS = "projects"
+    const val PERMISSIONS = "permissions"
+    const val BATCH_JOBS = "batchJobs"
+    const val RATE_LIMITS = "rateLimits"
+    const val MACHINE_TRANSLATIONS = "machineTranslations"
+    const val PROJECT_TRANSLATIONS_MODIFIED = "projectTranslationsModified"
+    const val DISMISSED_ANNOUNCEMENT = "dismissedAnnouncement"
+    const val AUTOMATIONS = "automations"
+    const val EE_SUBSCRIPTION = "eeSubscription"
+    const val LANGUAGES = "languages"
+    const val ORGANIZATION_ROLES = "organizationRoles"
+    const val SSO_TENANTS = "ssoTenants"
+    const val LLM_PROVIDERS = "llmProviders"
+    const val LANGUAGE_TOOL_RESULTS = "languageToolResults"
+
+    const val EE_LAST_REPORTED_USAGE = "eeLastReportedUsage"
+  }
+}

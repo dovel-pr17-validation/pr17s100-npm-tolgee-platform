@@ -1,0 +1,314 @@
+package io.tolgee.repository
+
+import io.tolgee.dtos.request.project.ProjectFilters
+import io.tolgee.model.Organization
+import io.tolgee.model.Project
+import io.tolgee.model.views.ProjectView
+import org.springframework.context.annotation.Lazy
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.Pageable
+import org.springframework.data.jpa.repository.JpaRepository
+import org.springframework.data.jpa.repository.Query
+import org.springframework.data.repository.query.Param
+import org.springframework.stereotype.Repository
+
+@Repository
+@Lazy
+interface ProjectRepository : JpaRepository<Project, Long> {
+  companion object {
+    const val BASE_VIEW_QUERY = """select r.id as id, r.name as name, r.description as description,
+        r.slug as slug, r.avatarHash as avatarHash,
+        r.useNamespaces as useNamespaces,
+        r.useBranching as useBranching,
+        r.useQaChecks as useQaChecks,
+        r.public as public,
+        r.suggestionsMode as suggestionsMode,
+        r.translationProtection as translationProtection,
+        dn as defaultNamespace, o as organizationOwner,
+        role.type as organizationRole, p as directPermission, r.icuPlaceholders as icuPlaceholders
+        from Project r
+        left join r.baseLanguage bl
+        left join r.defaultNamespace dn
+        left join Permission p on p.project = r and p.user.id = :userAccountId
+        left join Organization o on r.organizationOwner = o
+        left join fetch o.basePermission
+        left join OrganizationRole role on role.organization = o and role.user.id = :userAccountId
+        """
+
+    const val FILTERS = """
+        (
+            :#{#filters.filterId} is null
+            or r.id in :#{#filters.filterId}
+        )
+        and (
+            :#{#filters.filterNotId} is null
+            or r.id not in :#{#filters.filterNotId}
+        )
+        and (
+            :#{#filters.filterBaseLanguageTag} is null
+            or bl.tag = :#{#filters.filterBaseLanguageTag}
+        )
+    """
+
+    /** `o.deletedAt is null` is load-bearing — dropping it re-opens guest access to soft-deleted orgs. */
+    const val PUBLIC_PROJECT_VISIBILITY = """
+        r.public = true and r.deletedAt is null and r.organizationOwner is not null
+        and r.baseLanguage is not null and bl.deletedAt is null
+        and o.deletedAt is null
+        """
+
+    const val NON_MEMBER_FILTER = """
+        p is null and role is null
+        """
+
+    const val NON_MEMBER_CONTRIBUTOR_FILTER = """
+        $NON_MEMBER_FILTER
+        and exists (
+            select 1 from ProjectContributor pc
+            where pc.projectId = r.id and pc.userId = :userAccountId
+        )
+        """
+
+    /** `r.deletedAt`/`o.deletedAt` sit top-level so they also guard the permission branch, which [PUBLIC_PROJECT_VISIBILITY] does not. */
+    const val BELOW_MEMBER_ACCESSIBLE_PROJECT = """
+        (
+          r.deletedAt is null and o.deletedAt is null and (
+            ($PUBLIC_PROJECT_VISIBILITY)
+            or exists (
+              select perm.id from Permission perm
+              where perm.user.id = :userId and perm.project = r and (perm.type <> 'NONE' or perm.type is null)
+            )
+          )
+        )
+        """
+  }
+
+  @Query(
+    """select r, p, o, role from Project r
+        left join fetch Permission p on p.project = r and p.user.id = :userAccountId
+        left join fetch Organization o on r.organizationOwner = o
+        left join fetch OrganizationRole role on role.organization = o and role.user.id = :userAccountId
+        where (p is not null or role is not null)
+        and r.deletedAt is null
+        order by r.name
+        """,
+  )
+  fun findAllPermitted(userAccountId: Long): List<Array<Any>>
+
+  // it makes sense to give all projects to admin only when organizationId is provided
+  @Query(
+    """$BASE_VIEW_QUERY        
+        left join UserAccount ua on ua.id = :userAccountId
+        left join o.basePermission
+        where (
+            (p is not null and (p.type <> 'NONE' or p.type is null)) or
+            (role is not null
+                and (o.basePermission.type <> 'NONE' or o.basePermission.type is null) and p is null) or
+            ((ua.role = 'ADMIN' or ua.role = 'SUPPORTER') and :organizationId is not null) or
+            (:organizationId is not null and $PUBLIC_PROJECT_VISIBILITY))
+        and (
+            :search is null or (lower(r.name) like lower(concat('%', cast(:search as text), '%'))
+            or lower(o.name) like lower(concat('%', cast(:search as text),'%')))
+        )
+        and (:organizationId is null or o.id = :organizationId) and r.deletedAt is null
+        and (
+            :#{#filters.filterId} is null
+            or r.id in :#{#filters.filterId}
+        )
+        and (
+            :#{#filters.filterNotId} is null
+            or r.id not in :#{#filters.filterNotId}
+        )
+        and (
+            :#{#filters.filterBaseLanguageTag} is null
+            or bl.tag = :#{#filters.filterBaseLanguageTag}
+        )
+    """,
+  )
+  fun findAllPermitted(
+    userAccountId: Long,
+    pageable: Pageable,
+    @Param("search") search: String? = null,
+    organizationId: Long? = null,
+    filters: ProjectFilters,
+  ): Page<ProjectView>
+
+  /**
+   * Lists public projects for the anonymous endpoint. The `organizationOwner is not null` filter is
+   * required because the shared stats assembler dereferences a non-null `organizationOwner` (legacy
+   * user-owned projects would NPE). The `baseLanguage is not null and bl.deletedAt is null` filters keep
+   * out projects whose base language is missing/soft-deleted: the stats pipeline calls
+   * `languageService.getProjectLanguages`, which auto-assigns and persists a new base language
+   * (`setNewProjectBaseLanguage`) for any such project — an unauthenticated GET must never mutate.
+   */
+  @Query(
+    """$BASE_VIEW_QUERY
+        where $PUBLIC_PROJECT_VISIBILITY
+        and (
+            :search is null or (lower(r.name) like lower(concat('%', cast(:search as text), '%'))
+            or lower(o.name) like lower(concat('%', cast(:search as text),'%')))
+        )
+    """,
+  )
+  fun findAllPublic(
+    userAccountId: Long,
+    pageable: Pageable,
+    @Param("search") search: String? = null,
+  ): Page<ProjectView>
+
+  @Query(
+    """$BASE_VIEW_QUERY
+        where $PUBLIC_PROJECT_VISIBILITY
+        and (
+            :search is null or (lower(r.name) like lower(concat('%', cast(:search as text), '%'))
+            or lower(o.name) like lower(concat('%', cast(:search as text),'%')))
+        )
+        and ($NON_MEMBER_CONTRIBUTOR_FILTER)
+    """,
+  )
+  fun findAllPublicContributed(
+    userAccountId: Long,
+    pageable: Pageable,
+    @Param("search") search: String? = null,
+  ): Page<ProjectView>
+
+  @Query(
+    """select count(r) > 0 from Project r
+        left join r.baseLanguage bl
+        left join r.organizationOwner o
+        where $PUBLIC_PROJECT_VISIBILITY
+        and o.id = :organizationId
+    """,
+  )
+  fun hasPublicProjects(organizationId: Long): Boolean
+
+  @Query(
+    """
+      select pc.projectId from ProjectContributor pc
+      join Project r on r.id = pc.projectId
+      left join r.baseLanguage bl
+      left join r.organizationOwner o
+      left join Permission p on p.project = r and p.user.id = :userAccountId
+      left join OrganizationRole role on role.organization = o and role.user.id = :userAccountId
+      where pc.userId = :userAccountId
+        and $PUBLIC_PROJECT_VISIBILITY
+        and ($NON_MEMBER_FILTER)
+    """,
+  )
+  fun findNonMemberPublicContributionIds(
+    userAccountId: Long,
+    pageable: Pageable,
+  ): List<Long>
+
+  @Query(
+    """select r.id from Project r
+        left join r.baseLanguage bl
+        left join r.organizationOwner o
+        where o.id = :organizationId
+        and $BELOW_MEMBER_ACCESSIBLE_PROJECT
+    """,
+  )
+  fun getBelowMemberAccessibleProjectIds(
+    organizationId: Long,
+    userId: Long,
+  ): List<Long>
+
+  fun findAllByOrganizationOwnerId(organizationOwnerId: Long): List<Project>
+
+  @Query("select p.id from Project p where p.organizationOwner.deletedAt is not null")
+  fun findIdsInDeletedOrganizations(pageable: Pageable): Page<Long>
+
+  fun findAllByOrganizationOwnerIdAndDeletedAtIsNull(organizationOwnerId: Long): List<Project>
+
+  fun findAllByDeletedAtIsNull(): List<Project>
+
+  fun findAllByOrganizationOwnerIdAndUseQaChecksTrueAndDeletedAtIsNull(organizationOwnerId: Long): List<Project>
+
+  fun findAllByUseQaChecksTrueAndDeletedAtIsNull(): List<Project>
+
+  fun countAllBySlug(slug: String): Long
+
+  @Suppress("SpringDataRepositoryMethodReturnTypeInspection")
+  @Query(
+    """
+    $BASE_VIEW_QUERY
+    where r.id = :projectId and r.deletedAt is null
+  """,
+  )
+  fun findViewById(
+    userAccountId: Long,
+    projectId: Long,
+  ): ProjectView?
+
+  @Query(
+    """
+      from Project p where p.name = :name and p.deletedAt is null
+    """,
+  )
+  fun findAllByName(name: String): List<Project>
+
+  @Query(
+    """
+    from Project p 
+    where p.name = :name and p.organizationOwner = :organization and p.deletedAt is null
+  """,
+  )
+  fun findAllByNameAndOrganizationOwner(
+    name: String,
+    organization: Organization,
+  ): List<Project>
+
+  @Query(
+    """
+    from Project p 
+    where p.organizationOwner is null and p.userOwner is not null and p.deletedAt is null
+  """,
+  )
+  fun findAllWithUserOwner(pageable: Pageable): Page<Project>
+
+  @Query(
+    """
+    select p.id
+    from Project p
+    where p.organizationOwner is null and p.deletedAt is null
+  """,
+  )
+  fun findAllWithUserOwnerIds(): List<Long>
+
+  @Query(
+    """
+    select pp.user.id, p 
+    from Project p
+    join p.permissions pp on pp.user.id in :userIds
+    join fetch p.baseLanguage
+    where p.organizationOwner.id = :organizationId and p.deletedAt is null
+  """,
+  )
+  fun getProjectsWithDirectPermissions(
+    organizationId: Long,
+    userIds: List<Long>,
+  ): List<Array<Any>>
+
+  @Query(
+    """
+    from Project where id = :id and deletedAt is null
+  """,
+  )
+  fun find(id: Long): Project?
+
+  @Query(
+    """
+    from Project p
+    left join fetch p.branches
+    where p.id = :id and p.deletedAt is null
+    """,
+  )
+  fun findWithBranches(id: Long): Project?
+
+  @Query(
+    """
+    from Project where id = :id and deletedAt is not null
+  """,
+  )
+  fun findDeleted(id: Long): Project?
+}

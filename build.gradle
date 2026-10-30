@@ -1,0 +1,246 @@
+/*
+ * Copyright (c) 2020. Tolgee
+ */
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath libs.kotlin
+    }
+}
+
+plugins {
+    id("org.jlleitschuh.gradle.ktlint") version "${ktlintGradlePluginVersion}"
+    id "org.gradle.test-retry"
+}
+
+subprojects {
+    if (project.projectDir.exists()) {
+        apply {
+            plugin("org.jlleitschuh.gradle.ktlint")
+        }
+        extensions.configure(org.jlleitschuh.gradle.ktlint.KtlintExtension) {
+            it.version.set(ktlintVersion)
+        }
+    }
+}
+
+project.ext {
+    dbSchemaContainerName = 'tolgee_postgres_dbschema'
+}
+
+if (System.getenv().containsKey("VERSION")) {
+    project.version = System.getenv().get("VERSION")
+} else {
+    project.version = 'local'
+}
+
+apply plugin: 'idea'
+
+def unpackTarget = "${project.buildDir}/dependency"
+
+project(':server-app').afterEvaluate {
+    tasks.register('unpack', Copy) {
+        // cleanup the unpackTarget first so we don't have duplicated dependencies or other files, which
+        // can be there from previous builds
+        doFirst {
+            delete(unpackTarget)
+        }
+        from project(':server-app').tasks.named('bootJar').map {
+            zipTree(it.outputs.files.singleFile)
+        }
+        into unpackTarget
+        if (System.getenv("SKIP_SERVER_BUILD") != "true") {
+            dependsOn "bootJar"
+        }
+    }
+
+    tasks.register('addVersionFile', Task) {
+        mustRunAfter unpack
+        doLast {
+            def file = new File("${unpackTarget}/BOOT-INF/classes/.VERSION")
+            file.write(project.version.toString())
+        }
+    }
+
+    apply from: "./gradle/webapp.gradle"
+    apply from: "./gradle/docker.gradle"
+    apply from: "./gradle/e2e.gradle"
+
+    tasks.named("docker") {
+        mustRunAfter copyDist
+    }
+
+    tasks.register('packResources', Zip) {
+        dependsOn "unpack"
+        dependsOn "copyDist"
+        dependsOn "addVersionFile"
+        from "${project.projectDir}/build/dependency"
+        archiveFileName = "tolgee.jar"
+        destinationDirectory = file("$buildDir/libs")
+        entryCompression ZipEntryCompression.STORED
+    }
+
+    tasks.register('build') {
+        dependsOn ':server-app:build'
+        dependsOn runE2e
+    }
+
+    tasks.register('check') {
+        dependsOn ':server-app:check'
+        dependsOn ktlint
+    }
+
+    tasks.register('bootJar') {
+        dependsOn ':server-app:bootJar'
+    }
+
+    tasks.register('removeDbChangelogContainer', Exec) {
+        ignoreExitValue = true
+        commandLine "docker", "rm", "--force", "--volumes", dbSchemaContainerName
+    }
+
+    tasks.register('startDbChangelogContainer', Exec) {
+        dependsOn 'removeDbChangelogContainer'
+        commandLine "docker", "run", "-e", "POSTGRES_PASSWORD=postgres", "-d", "-p55538:5432", "--name", dbSchemaContainerName, "postgres:13"
+        doLast {
+            Thread.sleep(5000)
+        }
+    }
+
+    tasks.register('stopDbChangelogContainer', Exec) {
+        mustRunAfter ':data:diffChangelog'
+        mustRunAfter ':ee-app:diffChangelog'
+
+        commandLine "docker", "rm", "--force", "--volumes", dbSchemaContainerName
+    }
+
+    tasks.register('diffChangeLog') {
+        project(':server-app').tasks.named("bootRun") {
+            mustRunAfter(startDbChangelogContainer)
+        }
+
+        finalizedBy = [
+            startDbChangelogContainer,
+            ':server-app:bootRun',
+            ':data:diffChangelog',
+        ]
+
+        if (gradle.ext.billingAppDirectory.exists()) {
+            finalizedBy.add(':billing-app:diffChangelog')
+        }
+
+        if (gradle.ext.eeAppDirectoryExists) {
+            finalizedBy.add(':ee-app:diffChangelog')
+        }
+
+        finalizedBy.add(stopDbChangelogContainer)
+
+        doFirst {
+            project(':server-app').bootRun
+                .systemProperty('spring.profiles.active', 'dbschema')
+                // Use an unlikely-to-be-used port
+                .systemProperty('server.port', '61987')
+        }
+    }
+
+    subprojects.forEach {
+        it.tasks.matching { task -> task.name == 'diffChangelog' }.configureEach {
+            mustRunAfter ':server-app:bootRun'
+        }
+    }
+}
+
+subprojects {
+    tasks.register('allDeps', DependencyReportTask)
+
+    ext['hibernate.version'] = hibernateVersion
+    ext['commons-lang3.version'] = commonsLang3Version
+    ext['netty.version'] = nettyVersion
+    ext['jackson-bom.version'] = jacksonVersion
+    ext['jackson-2-bom.version'] = jackson2Version
+
+    plugins.withId('io.spring.dependency-management') {
+        dependencyManagement {
+            dependencies {
+                // azure-core-amqp pins proton-j 0.34.1 (CVE-2026-66273/66274/66275/66276);
+                // no Azure SDK release ships the patched version yet.
+                dependency 'org.apache.qpid:proton-j:0.35.0'
+            }
+        }
+    }
+
+    // Prepend the antlr4-runtime hibernate-jpamodelgen needs to the kapt worker bootclasspath, else an
+    // older one wins and kapt fails: "Could not deserialize ATN with version 4 (expected 3)".
+    tasks.matching { it.name == 'kaptKotlin' }.configureEach {
+        def antlrRuntimeJar = configurations.kapt.files.find { it.name.startsWith('antlr4-runtime') }
+        if (antlrRuntimeJar != null) {
+            kaptProcessJvmArgs.add('-Xbootclasspath/a:' + antlrRuntimeJar.absolutePath)
+        }
+    }
+
+    tasks.withType(Test).configureEach {
+        testLogging {
+            events "passed", "skipped", "failed", "started"
+        }
+        // loads the extensions registered in META-INF/services, e.g. TestShardCondition
+        systemProperty 'junit.jupiter.extensions.autodetection.enabled', 'true'
+    }
+
+    tasks.matching {
+        it.name in [
+            "classes",
+            "compileJava",
+            "compileKotlin",
+            "kaptKotlin",
+            "kaptGenerateStubsKotlin",
+            "bootBuildInfo",
+            "bootJarMainClassName",
+            "jar",
+            "bootJar"
+        ]
+    }.configureEach {
+        onlyIf { System.getenv("SKIP_SERVER_BUILD") != "true" }
+    }
+}
+
+ext.setTestSharding = { test ->
+    def shardIndex = System.getenv('SHARD_INDEX')
+    def shardTotal = System.getenv('SHARD_TOTAL')
+    // unsharded matrix rows pass the variables as empty strings
+    if (!shardIndex || !shardTotal) {
+        return
+    }
+    def valid = shardIndex.isInteger() && shardTotal.isInteger() && shardIndex.toInteger() < shardTotal.toInteger()
+    if (!valid) {
+        // an index outside the range skips every class and the task passes having run nothing
+        throw new GradleException("SHARD_INDEX=$shardIndex must be a number below SHARD_TOTAL=$shardTotal")
+    }
+    test.systemProperty 'tolgee.test.shard.index', shardIndex
+    test.systemProperty 'tolgee.test.shard.total', shardTotal
+}
+
+// Define the setTestRetry method at the root level so it can be used by all subprojects
+ext.setTestRetry = { test ->
+    boolean isCiServer = System.getenv().containsKey("CI")
+    boolean isRelease = System.getenv().get("CI_RELEASE") == "true"
+    boolean detectFlaky = System.getenv().get("DETECT_FLAKY_TESTS") == "true"
+
+    test.retry {
+        if (isCiServer) {
+            maxFailures = 20
+            maxRetries = 5
+        }
+        // Flaky-detection runs collect flakes from the test reports instead of
+        // failing the build, so a run with only flaky tests stays green.
+        failOnPassedAfterRetry = !isRelease && !detectFlaky
+    }
+
+    if (detectFlaky) {
+        // Merge retries into a single <testcase> so a test that failed then
+        // passed is recorded as <flakyFailure> while a test that failed every
+        // attempt is recorded as <failure>.
+        test.reports.junitXml.mergeReruns = true
+    }
+}

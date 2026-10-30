@@ -1,0 +1,50 @@
+package io.tolgee.component.cacheWithExpiration
+
+import io.tolgee.component.CurrentDateProvider
+import io.tolgee.component.ResilientCacheAccessor
+import org.springframework.cache.Cache
+import org.springframework.cache.Cache.ValueWrapper
+import java.time.Duration
+
+class CacheWithExpiration(
+  private val cache: Cache,
+  private val currentDateProvider: CurrentDateProvider,
+  private val resilientCacheAccessor: ResilientCacheAccessor,
+) {
+  fun <T : Any?> get(key: Any): T? =
+    resilientCacheAccessor.get(cache, key, CachedWithExpiration::class.java)?.let { getNotExpiredValue(key, it) }
+
+  fun getWrapper(key: Any): ValueWrapper? {
+    val cached = resilientCacheAccessor.get(cache, key, CachedWithExpiration::class.java) ?: return null
+    val value = getNotExpiredValue<Any>(key, cached)
+    return ValueWrapper { value }
+  }
+
+  private fun <T> getNotExpiredValue(
+    key: Any,
+    cached: CachedWithExpiration,
+  ): T? {
+    if (cached.expiresAt > currentDateProvider.date.time) {
+      @Suppress("UNCHECKED_CAST")
+      return cached.data as? T
+    }
+    cache.evict(key)
+    return null
+  }
+
+  fun put(
+    key: Any,
+    value: Any?,
+    expiration: Duration,
+  ) {
+    cache.put(key, CachedWithExpiration(currentDateProvider.date.time + expiration.toMillis(), value))
+  }
+
+  fun evict(key: Any) {
+    cache.evict(key)
+  }
+
+  fun clear() {
+    cache.clear()
+  }
+}

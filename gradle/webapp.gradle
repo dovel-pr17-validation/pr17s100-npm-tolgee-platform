@@ -1,0 +1,58 @@
+apply from: './gradle/utils.gradle'
+
+def libraryPath = "${project.projectDir}/library"
+def webappPath = "${project.projectDir}/webapp"
+
+tasks.register('copyDist', Copy) {
+    def fromDir = "${webappPath}/dist"
+    def toDir = "${project.projectDir}/build/dependency/BOOT-INF/classes/static/."
+    from fromDir
+    into toDir
+    mustRunAfter unpack
+    dependsOn "buildWebapp"
+}
+
+tasks.register('installLibraryDeps', Exec) {
+    onlyIf { System.getenv("SKIP_WEBAPP_BUILD") != "true" }
+    commandLine npmCommandName, "ci"
+    workingDir = libraryPath
+    inputs.file("${libraryPath}/package.json")
+    inputs.file("${libraryPath}/package-lock.json")
+    outputs.dir("${libraryPath}/node_modules")
+}
+
+tasks.register('installWebappDeps', Exec) {
+    onlyIf { System.getenv("SKIP_WEBAPP_BUILD") != "true" }
+    commandLine npmCommandName, "ci"
+    workingDir = webappPath
+    inputs.file("${webappPath}/package.json")
+    inputs.file("${webappPath}/package-lock.json")
+    outputs.dir("${webappPath}/node_modules")
+}
+
+tasks.register('buildWebapp', Exec) {
+    onlyIf { System.getenv("SKIP_WEBAPP_BUILD") != "true" }
+    commandLine npmCommandName, "run", "build"
+    workingDir = webappPath
+    inputs.dir(webappPath)
+    outputs.dir("${webappPath}/dist/")
+    dependsOn "installLibraryDeps", "installWebappDeps", "updateStaticTranslations"
+}
+
+tasks.register('createBuildDir') {
+    doLast {
+        File directory = new File(buildDir as String)
+        if (!directory.exists()) {
+            directory.mkdir()
+        }
+    }
+}
+
+tasks.register('updateStaticTranslations', Exec) {
+    onlyIf { System.getenv("SKIP_WEBAPP_BUILD") != "true" }
+    def tolgeeApiUrl = System.env.TOLGEE_API_URL
+    onlyIf { tolgeeApiUrl != null && tolgeeApiUrl != "" }
+    workingDir = webappPath
+    commandLine npmCommandName, "run", "load-translations"
+    dependsOn(createBuildDir)
+}

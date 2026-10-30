@@ -1,0 +1,25 @@
+import { globalContext } from 'tg.globalContext/globalActions';
+
+/**
+ * Performs action for defined error codes
+ *
+ * @return Returns true if the error is handled and other error handling should be skipped
+ */
+export const errorAction = (code: string) => {
+  switch (code) {
+    case 'plan_translation_limit_exceeded':
+    case 'plan_seat_limit_exceeded':
+    case 'plan_key_limit_exceeded':
+    case 'plan_word_limit_exceeded':
+      globalContext.actions?.incrementPlanLimitErrors(code);
+      return true;
+    case 'translation_spending_limit_exceeded':
+    case 'seats_spending_limit_exceeded':
+    case 'keys_spending_limit_exceeded':
+    case 'words_spending_limit_exceeded':
+      globalContext.actions?.incrementSpendingLimitErrors();
+      return true;
+    default:
+      return false;
+  }
+};

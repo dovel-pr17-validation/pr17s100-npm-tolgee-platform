@@ -1,0 +1,133 @@
+package io.tolgee.security.oauth2
+
+import io.tolgee.component.BackendUrlProvider
+import io.tolgee.component.FrontendUrlProvider
+import io.tolgee.configuration.tolgee.TolgeeProperties
+import io.tolgee.testing.assert
+import org.assertj.core.api.Assertions.assertThatCode
+import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.junit.jupiter.api.Test
+import org.mockito.kotlin.doReturn
+import org.mockito.kotlin.mock
+
+class OAuth2IssuerResolverTest {
+  @Test
+  fun `a blank url counts as unset, so reading the issuer fails`() {
+    assertThatThrownBy { resolverFor(backEnd = "", frontEnd = "   ").issuerUrl }
+      .isInstanceOf(IllegalStateException::class.java)
+  }
+
+  @Test
+  fun `prefers the back-end url over the front-end url`() {
+    resolverFor(
+      backEnd = "https://back.example.com",
+      frontEnd = "https://front.example.com",
+    ).issuerUrl.assert.isEqualTo("https://back.example.com")
+  }
+
+  @Test
+  fun `falls back to the front-end url for single-origin deployments`() {
+    resolverFor(backEnd = null, frontEnd = "https://front.example.com")
+      .issuerUrl.assert
+      .isEqualTo("https://front.example.com")
+  }
+
+  @Test
+  fun `strips a trailing slash so every consumer advertises the same issuer`() {
+    resolverFor(backEnd = "https://back.example.com/", frontEnd = null)
+      .issuerUrl.assert
+      .isEqualTo("https://back.example.com")
+  }
+
+  @Test
+  fun `issuerUrl refuses to invent an issuer when nothing is configured`() {
+    assertThatThrownBy { resolverFor(backEnd = null, frontEnd = null).issuerUrl }
+      .isInstanceOf(IllegalStateException::class.java)
+  }
+
+  @Test
+  fun `issuerUrl is the configured value`() {
+    resolverFor(backEnd = "https://public.example.com", frontEnd = null)
+      .issuerUrl.assert
+      .isEqualTo("https://public.example.com")
+  }
+
+  @Test
+  fun `refuses an issuer with a path, naming the property to fix`() {
+    assertThatThrownBy { resolverFor("https://tolgee.example.com/tolgee", null).issuerUrl }
+      .isInstanceOf(IllegalStateException::class.java)
+      .hasMessageContaining("tolgee.back-end-url")
+
+    assertThatThrownBy { resolverFor(null, "https://tolgee.example.com/app").issuerUrl }
+      .isInstanceOf(IllegalStateException::class.java)
+  }
+
+  @Test
+  fun `refuses an issuer carrying a query or a fragment`() {
+    assertThatThrownBy { resolverFor("https://tolgee.example.com?tenant=a", null).issuerUrl }
+      .isInstanceOf(IllegalStateException::class.java)
+    assertThatThrownBy { resolverFor("https://tolgee.example.com#f", null).issuerUrl }
+      .isInstanceOf(IllegalStateException::class.java)
+  }
+
+  @Test
+  fun `accepts a bare origin, with or without a trailing slash`() {
+    resolverFor("https://tolgee.example.com/", null).issuerUrl.assert.isEqualTo("https://tolgee.example.com")
+    resolverFor("https://tolgee.example.com", null).issuerUrl.assert.isEqualTo("https://tolgee.example.com")
+  }
+
+  @Test
+  fun `a malformed issuer does not stop an instance booting - it only turns the OAuth server off`() {
+    val resolver = resolverFor("https://tolgee.example.com/tolgee", null)
+
+    assertThatCode { resolver.warnOnUnusableIssuer() }.doesNotThrowAnyException()
+    resolver.isConfigured.assert.isFalse()
+  }
+
+  @Test
+  fun `an unset issuer does not fail startup - the server is simply off`() {
+    assertThatCode { resolverFor(null, null).warnOnUnusableIssuer() }.doesNotThrowAnyException()
+  }
+
+  @Test
+  fun `isConfigured reflects a usable issuer`() {
+    resolverFor("https://tolgee.example.com", null).isConfigured.assert.isTrue()
+    resolverFor(null, "https://front.example.com").isConfigured.assert.isTrue()
+    resolverFor(null, null).isConfigured.assert.isFalse()
+    resolverFor("https://tolgee.example.com/path", null).isConfigured.assert.isFalse()
+  }
+
+  @Test
+  fun `isConfigured says exactly whether the issuer can be read`() {
+    // OAuth2ClientRegistry seeds the CLI client on isConfigured alone, and skips the startup check that a configured
+    // client gets. That is only safe while these two cannot disagree: a resolver that claimed to be configured while
+    // issuerUrl throws would register a client on an instance whose OAuth endpoints cannot answer.
+    listOf(
+      resolverFor("https://tolgee.example.com", null),
+      resolverFor(null, "https://front.example.com"),
+      resolverFor(null, null),
+      resolverFor("", null),
+      resolverFor("https://tolgee.example.com/path", null),
+      resolverFor(null, "https://front.example.com/x?q=1"),
+    ).forEach { resolver ->
+      resolver.isConfigured.assert
+        .isEqualTo(runCatching { resolver.issuerUrl }.isSuccess)
+    }
+  }
+
+  private fun resolverFor(
+    backEnd: String?,
+    frontEnd: String?,
+  ) = OAuth2IssuerResolver(
+    BackendUrlProvider(propertiesWith(backEnd, frontEnd)),
+    FrontendUrlProvider(propertiesWith(backEnd, frontEnd)),
+  )
+
+  private fun propertiesWith(
+    backEnd: String?,
+    frontEnd: String?,
+  ) = mock<TolgeeProperties> {
+    on { backEndUrl } doReturn backEnd
+    on { frontEndUrl } doReturn frontEnd
+  }
+}

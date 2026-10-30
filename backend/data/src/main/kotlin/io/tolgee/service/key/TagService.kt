@@ -1,0 +1,421 @@
+package io.tolgee.service.key
+
+import io.tolgee.constants.Message
+import io.tolgee.dtos.request.ComplexTagKeysRequest
+import io.tolgee.exceptions.BadRequestException
+import io.tolgee.exceptions.NotFoundException
+import io.tolgee.model.Project
+import io.tolgee.model.dataImport.WithKeyMeta
+import io.tolgee.model.key.Key
+import io.tolgee.model.key.Tag
+import io.tolgee.repository.TagRepository
+import io.tolgee.service.security.SecurityService
+import io.tolgee.util.Logging
+import jakarta.persistence.EntityManager
+import org.springframework.context.ApplicationContext
+import org.springframework.context.annotation.Lazy
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.Pageable
+import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Transactional
+
+@Service
+class TagService(
+  private val tagRepository: TagRepository,
+  private val keyMetaService: KeyMetaService,
+  @Lazy
+  private val keyService: KeyService,
+  private val entityManager: EntityManager,
+  private val applicationContext: ApplicationContext,
+  @Lazy
+  private val securityService: SecurityService,
+) : Logging {
+  @Transactional
+  fun tagKey(
+    key: Key,
+    tagName: String,
+  ): Tag {
+    val keyMeta = keyMetaService.getOrCreateForKey(key)
+    val tag =
+      find(key.project, tagName)?.let {
+        if (!keyMeta.tags.contains(it)) {
+          // Don't access it.keyMetas - triggers lazy load of all KeyMeta for this tag
+          // Only update owning side (keyMeta.tags) - JPA will sync the join table
+          keyMeta.tags.add(it)
+        }
+        it
+      } ?: let {
+        Tag().apply {
+          project = key.project
+          keyMetas.add(keyMeta)
+          name = tagName
+          keyMeta.tags.add(this)
+        }
+      }
+
+    if (tag.name.length > 100) {
+      throw BadRequestException(Message.TAG_TOO_LOG)
+    }
+
+    tagRepository.save(tag)
+    keyMetaService.save(keyMeta)
+    return tag
+  }
+
+  /**
+   * @param map key entity to list of tags
+   */
+  @Transactional
+  fun tagKeys(map: Map<Key, List<String>>) {
+    if (map.isEmpty()) {
+      return
+    }
+
+    val keysWithTags = keyService.getKeysWithTags(map.keys)
+    tagKeys(keysWithTags, map.mapKeys { it.key.id })
+  }
+
+  /**
+   * @param map keyId entity to list of tags
+   */
+  @Transactional
+  fun tagKeysById(
+    projectId: Long,
+    map: Map<Long, List<String>>,
+  ): Map<Long, List<Tag>> {
+    if (map.isEmpty()) {
+      return emptyMap()
+    }
+
+    val keysWithTags = keyService.getKeysWithTagsById(projectId, map.keys)
+    return tagKeys(keysWithTags, map)
+  }
+
+  private fun tagKeys(
+    keysWithFetchedTags: Iterable<Key>,
+    map: Map<Long, List<String>>,
+  ): Map<Long, List<Tag>> {
+    val keysByIdMap = keysWithFetchedTags.associateBy { it.id }
+    val projectId = getSingleProjectId(keysByIdMap)
+
+    val existingTags =
+      this.getFromProject(projectId, map.values.flatten().toSet()).associateBy { it.name }.toMutableMap()
+
+    return map
+      .map { (keyId, tagsToAdd) ->
+        keyId to
+          tagsToAdd.map { tagToAdd ->
+            val keyWithData = keysByIdMap[keyId] ?: throw NotFoundException(Message.KEY_NOT_FOUND)
+            val keyMeta = keyMetaService.getOrCreateForKey(keyWithData)
+            val tag =
+              existingTags[tagToAdd]?.let {
+                if (!keyMeta.tags.contains(it)) {
+                  // Don't access it.keyMetas directly - it triggers massive query for all KeyMeta on this tag
+                  // Instead, just update the owning side (keyMeta.tags)
+                  keyMeta.tags.add(it)
+                }
+                it
+              } ?: let {
+                Tag().apply {
+                  project = keysByIdMap[keyId]?.project ?: throw NotFoundException(Message.KEY_NOT_FOUND)
+                  keyMetas.add(keyMeta)
+                  name = tagToAdd
+                  keyMeta.tags.add(this)
+                  existingTags[tagToAdd] = this
+                }
+              }
+            tagRepository.save(tag)
+            keyMetaService.save(keyMeta)
+            tag
+          }
+      }.toMap()
+  }
+
+  @Transactional
+  fun untagKeys(
+    projectId: Long,
+    map: Map<Long, List<String>>,
+  ) {
+    if (map.isEmpty()) {
+      return
+    }
+
+    val keysWithTags = keyService.getKeysWithTagsById(projectId, map.keys)
+    untagKeys(keysWithTags, map)
+  }
+
+  private fun untagKeys(
+    keysWithFetchedTags: Iterable<Key>,
+    map: Map<Long, List<String>>,
+  ) {
+    val keysByIdMap = keysWithFetchedTags.associateBy { it.id }
+
+    map.forEach { (keyId, tagsToRemove) ->
+      keysByIdMap[keyId]?.keyMeta?.let { keyMeta ->
+        keyMeta.tags.removeIf { tagsToRemove.contains(it.name) }
+        keyMetaService.save(keyMeta)
+      }
+    }
+
+    keysWithFetchedTags.map { it.project.id }.toSet().forEach {
+      this.removeUnusedTags(it)
+    }
+  }
+
+  private fun removeUnusedTags(projectId: Long) {
+    tagRepository.deleteAllUnused(projectId)
+  }
+
+  private fun getSingleProjectId(keysWithTags: Map<Long, Key>): Long {
+    val projectIds = keysWithTags.map { it.value.project.id }.toSet()
+
+    if (projectIds.size > 1) {
+      throw BadRequestException(Message.MULTIPLE_PROJECTS_NOT_SUPPORTED)
+    }
+
+    if (projectIds.isEmpty()) {
+      throw IllegalStateException("No project found? This should not happen.")
+    }
+
+    return projectIds.single()
+  }
+
+  private fun getFromProject(
+    projectId: Long,
+    tags: Collection<String>,
+  ): List<Tag> {
+    return tagRepository.findAllByProject(projectId, tags)
+  }
+
+  fun remove(
+    key: Key,
+    tag: Tag,
+  ) {
+    key.keyMeta?.let { keyMeta ->
+      keyMeta.tags.remove(tag)
+      keyMetaService.save(keyMeta)
+      tagRepository.deleteUnusedByIdIn(listOf(tag.id))
+    }
+  }
+
+  @Transactional
+  fun updateTags(
+    key: Key,
+    newTags: List<String>,
+  ) {
+    val tagsToRemove = key.keyMeta?.tags?.filter { it.name !in newTags } ?: emptyList()
+
+    tagsToRemove.forEach {
+      this.remove(key, it)
+    }
+
+    newTags.forEach {
+      tagKey(key, it)
+    }
+  }
+
+  fun getProjectTags(
+    projectId: Long,
+    search: String? = null,
+    pageable: Pageable,
+  ): Page<Tag> {
+    return tagRepository.findAllByProject(projectId, search, pageable)
+  }
+
+  fun getTagsForKeyIds(keyIds: Iterable<Long>): Map<Long, List<Tag>> {
+    val keys = tagRepository.getKeysWithTags(keyIds)
+    return keys.associate { key -> key.id to (key.keyMeta?.tags?.toList() ?: listOf()) }
+  }
+
+  fun saveAll(entities: Iterable<Tag>) {
+    tagRepository.saveAll(entities)
+  }
+
+  fun find(id: Long): Tag? {
+    return tagRepository.findById(id).orElse(null)
+  }
+
+  fun findWithKeyMetasFetched(
+    projectId: Long,
+    id: Long,
+  ): Tag? {
+    return tagRepository.findWithKeyMetasFetched(projectId, id)
+  }
+
+  fun getWithKeyMetasFetched(
+    projectId: Long,
+    id: Long,
+  ): Tag {
+    return findWithKeyMetasFetched(projectId, id) ?: throw NotFoundException(Message.TAG_NOT_FOUND)
+  }
+
+  fun get(id: Long): Tag {
+    return find(id) ?: throw NotFoundException()
+  }
+
+  fun getAllFromProject(projectId: Long): List<Tag> {
+    return tagRepository.findAllByProjectId(projectId)
+  }
+
+  fun find(
+    project: Project,
+    tagName: String,
+  ): Tag? {
+    return tagRepository.findByProjectAndName(project, tagName)
+  }
+
+  fun deleteAllByImportKeyIdIn(importKeyIds: List<Long>) {
+    val importKeys = tagRepository.getImportKeysWithTags(importKeyIds)
+    deleteAllTagsForKeys(importKeys)
+  }
+
+  fun deleteAllByKeyIdIn(keyIds: Collection<Long>) {
+    val keys =
+      traceLogMeasureTime("tagService: deleteAllByKeyIdIn: getKeysWithTags") {
+        tagRepository.getKeysWithTags(keyIds)
+      }
+    deleteAllTagsForKeys(keys)
+  }
+
+  private fun deleteAllTagsForKeys(keys: Iterable<WithKeyMeta>) {
+    val keyMetas = keys.mapNotNull { it.keyMeta }
+    if (keyMetas.isEmpty()) return
+
+    val tagIds = keyMetas.flatMap { km -> km.tags.map { it.id } }.toSet()
+    if (tagIds.isEmpty()) return
+
+    // Clear tags from each keyMeta (owning side): removes join-table entries
+    // and triggers activity logging via @ActivityLoggedProp on KeyMeta.tags.
+    keyMetas.forEach { keyMeta ->
+      keyMeta.tags.clear()
+      keyMetaService.save(keyMeta)
+    }
+
+    // Delete tags that have no remaining keyMetas, atomically.
+    // deleteUnusedByIdIn re-checks NOT EXISTS at delete time, so two concurrent
+    // transactions cannot both skip the delete and leave orphaned tags.
+    // flushAutomatically = true ensures key_meta_tags removals are written
+    // before the DELETE FROM tag runs (Hibernate would not auto-flush across tables).
+    tagRepository.deleteUnusedByIdIn(tagIds)
+  }
+
+  /**
+   * We don't need to store history or handle events when deleting whole project.
+   * So we can go for native query.
+   */
+  fun deleteAllByProject(projectId: Long) {
+    entityManager
+      .createNativeQuery(
+        """
+      delete from key_meta_tags kmt 
+        where kmt.key_metas_id in 
+        (select km.id from key_meta km join key k on km.key_id = k.id where k.project_id = :projectId)""",
+      ).setParameter("projectId", projectId)
+      .executeUpdate()
+    entityManager
+      .createNativeQuery(
+        """
+      delete from tag where project_id = :projectId
+      """,
+      ).setParameter("projectId", projectId)
+      .executeUpdate()
+  }
+
+  @Transactional
+  fun complexTagOperation(
+    projectId: Long,
+    req: ComplexTagKeysRequest,
+    branch: String?,
+  ) {
+    val provider =
+      ComplexTagOperationKeyProvider(projectId, req, branch, applicationContext)
+
+    if (req.tagFiltered != null || req.untagFiltered != null) {
+      val untagFilteredWithAppliedWildcards = req.untagFiltered?.applyWildcards(projectId)?.toList()
+      tagAndUntag(req.tagFiltered, untagFilteredWithAppliedWildcards, provider.filtered)
+    }
+
+    if (req.tagOther != null || req.untagOther != null) {
+      val untagOtherWithAppliedWildcards = req.untagOther?.applyWildcards(projectId)?.toList()
+      provider.restKeyIds.chunked(COMPLEX_TAG_BATCH_SIZE).forEach { chunkIds ->
+        val keys = keyService.getKeysWithTagsById(projectId, chunkIds)
+        tagAndUntag(req.tagOther, untagOtherWithAppliedWildcards, keys.toList())
+      }
+    }
+  }
+
+  private fun Collection<String>.applyWildcards(projectId: Long): Collection<String> {
+    return WildcardTagsProvider(entityManager).getTagsWithAppliedWildcards(projectId, this)
+  }
+
+  private fun TagService.tagAndUntag(
+    tagWith: List<String>?,
+    untagWith: List<String>?,
+    keys: List<Key>,
+  ): Boolean {
+    if (keys.isEmpty()) {
+      return true
+    }
+    tagKeys(keys, tagWith)
+    untagKeys(keys, untagWith)
+    return false
+  }
+
+  private fun tagKeys(
+    keysWithFetchedTags: List<Key>,
+    tags: List<String>?,
+  ) {
+    if (tags != null) {
+      val mapToTag = keysWithFetchedTags.associate { it.id to tags }
+      tagKeys(keysWithFetchedTags, mapToTag)
+    }
+  }
+
+  private fun untagKeys(
+    keysWithFetchedTags: List<Key>,
+    tags: List<String>?,
+  ) {
+    if (tags != null) {
+      val mapToTag = keysWithFetchedTags.associate { it.id to tags }
+      untagKeys(keysWithFetchedTags, mapToTag)
+    }
+  }
+
+  @Transactional
+  fun tagKey(
+    projectId: Long,
+    keyId: Long,
+    tagName: String,
+  ): Tag {
+    val key = keyService.getKeysWithTagsById(projectId, listOf(keyId)).singleOrNull() ?: throw NotFoundException()
+    securityService.checkBranchModify(key)
+    return tagKeys(listOf(key), mapOf(key.id to listOf(tagName))).values.singleOrNull()?.singleOrNull()
+      ?: throw IllegalStateException("No single tag found in result.")
+  }
+
+  @Transactional
+  fun removeTag(
+    projectId: Long,
+    keyId: Long,
+    tagId: Long,
+  ) {
+    val key = keyService.getKeysWithTagsById(projectId, listOf(keyId)).singleOrNull() ?: throw NotFoundException()
+    securityService.checkBranchModify(key)
+    removeKeyTag(key, tagId)
+  }
+
+  @Transactional
+  fun removeKeyTag(
+    key: Key,
+    tagId: Long,
+  ) {
+    val tag =
+      tagRepository.findByIdAndProjectId(tagId, key.project.id)
+        ?: throw NotFoundException(Message.TAG_NOT_FOUND)
+    remove(key, tag)
+  }
+
+  companion object {
+    private const val COMPLEX_TAG_BATCH_SIZE = 5000
+  }
+}

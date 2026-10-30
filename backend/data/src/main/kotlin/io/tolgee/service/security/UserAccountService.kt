@@ -1,0 +1,796 @@
+package io.tolgee.service.security
+
+import io.tolgee.api.isMfaEnabled
+import io.tolgee.component.CurrentDateProvider
+import io.tolgee.component.demoProject.DemoProjectData
+import io.tolgee.configuration.tolgee.TolgeeProperties
+import io.tolgee.constants.Caches
+import io.tolgee.constants.Message
+import io.tolgee.dtos.cacheable.UserAccountDto
+import io.tolgee.dtos.queryResults.UserAccountView
+import io.tolgee.dtos.request.UserUpdatePasswordRequestDto
+import io.tolgee.dtos.request.UserUpdateRequestDto
+import io.tolgee.dtos.request.task.UserAccountFilters
+import io.tolgee.dtos.request.userAccount.UserAccountPermissionsFilters
+import io.tolgee.dtos.request.validators.exceptions.ValidationException
+import io.tolgee.events.OnUserCountChanged
+import io.tolgee.events.user.OnUserCreated
+import io.tolgee.events.user.OnUserDeleted
+import io.tolgee.events.user.OnUserUpdated
+import io.tolgee.exceptions.AuthenticationException
+import io.tolgee.exceptions.BadRequestException
+import io.tolgee.exceptions.NotFoundException
+import io.tolgee.exceptions.PermissionException
+import io.tolgee.model.UserAccount
+import io.tolgee.model.enums.ThirdPartyAuthType
+import io.tolgee.model.enums.UserDisabledBy
+import io.tolgee.model.isSupporterOrAdmin
+import io.tolgee.model.notifications.Notification
+import io.tolgee.model.notifications.NotificationType
+import io.tolgee.model.views.ExtendedUserAccountInProject
+import io.tolgee.model.views.UserAccountInProjectView
+import io.tolgee.model.views.UserAccountWithOrganizationRoleView
+import io.tolgee.repository.UserAccountRepository
+import io.tolgee.security.oauth2.OAuth2AuthorizationService
+import io.tolgee.service.AiPlaygroundResultService
+import io.tolgee.service.AvatarService
+import io.tolgee.service.EmailVerificationService
+import io.tolgee.service.notification.NotificationService
+import io.tolgee.service.organization.OrganizationService
+import io.tolgee.util.Logging
+import io.tolgee.util.addMinutes
+import io.tolgee.util.logger
+import jakarta.persistence.EntityManager
+import jakarta.servlet.http.HttpServletRequest
+import org.apache.commons.lang3.time.DateUtils
+import org.hibernate.validator.internal.constraintvalidators.bv.EmailValidator
+import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.cache.CacheManager
+import org.springframework.cache.annotation.CacheEvict
+import org.springframework.cache.annotation.Cacheable
+import org.springframework.context.ApplicationEventPublisher
+import org.springframework.context.annotation.Lazy
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.PageImpl
+import org.springframework.data.domain.Pageable
+import org.springframework.security.crypto.password.PasswordEncoder
+import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Transactional
+import java.io.InputStream
+import java.util.Calendar
+import java.util.Date
+
+@Service
+@Suppress("SelfReferenceConstructorParameter")
+class UserAccountService(
+  @Lazy
+  private val userAccountRepository: UserAccountRepository,
+  private val applicationEventPublisher: ApplicationEventPublisher,
+  private val tolgeeProperties: TolgeeProperties,
+  private val avatarService: AvatarService,
+  private val passwordEncoder: PasswordEncoder,
+  @Lazy
+  private val organizationService: OrganizationService,
+  private val entityManager: EntityManager,
+  private val currentDateProvider: CurrentDateProvider,
+  private val cacheManager: CacheManager,
+  @Lazy
+  private val self: UserAccountService,
+  @Lazy
+  private val mfaService: MfaService,
+) : Logging {
+  @Autowired
+  @Lazy
+  private lateinit var aiPlaygroundResultService: AiPlaygroundResultService
+
+  @Autowired
+  lateinit var emailVerificationService: EmailVerificationService
+
+  @Autowired
+  @Lazy
+  lateinit var permissionService: PermissionService
+
+  @Autowired
+  private lateinit var notificationService: NotificationService
+
+  @Autowired
+  @Lazy
+  private lateinit var oauth2AuthorizationService: OAuth2AuthorizationService
+
+  private val emailValidator = EmailValidator()
+
+  fun findActive(username: String): UserAccount? {
+    return userAccountRepository.findActive(username)
+  }
+
+  fun findActiveOrDisabled(username: String): UserAccount? {
+    return userAccountRepository.findActiveOrDisabled(username)
+  }
+
+  fun findAllByUsername(username: String): List<UserAccount> {
+    return userAccountRepository.findAllByExactUsername(username)
+  }
+
+  operator fun get(username: String): UserAccount {
+    return this.findActive(username) ?: throw NotFoundException(Message.USER_NOT_FOUND)
+  }
+
+  fun findActive(id: Long): UserAccount? {
+    return userAccountRepository.findActive(id)
+  }
+
+  fun findActiveOrDisabled(id: Long): UserAccount? {
+    return userAccountRepository.findActiveOrDisabled(id)
+  }
+
+  @Transactional
+  fun findInitialUser(): UserAccount? {
+    return userAccountRepository.findInitialUser()
+  }
+
+  @Transactional
+  fun get(id: Long): UserAccount {
+    return this.findActive(id) ?: throw NotFoundException(Message.USER_NOT_FOUND)
+  }
+
+  @Cacheable(cacheNames = [Caches.USER_ACCOUNTS], key = "#id")
+  @Transactional
+  fun findDto(id: Long): UserAccountDto? {
+    return findActive(id)?.let {
+      UserAccountDto.fromEntity(it)
+    }
+  }
+
+  @Transactional
+  fun findAll(ids: List<Long>): List<UserAccountDto> {
+    return userAccountRepository.findAllById(ids).map { UserAccountDto.fromEntity(it) }
+  }
+
+  @Transactional
+  fun getDto(id: Long): UserAccountDto {
+    return self.findDto(id) ?: throw NotFoundException(Message.USER_NOT_FOUND)
+  }
+
+  fun getOrCreateDemoUsers(demoUsers: List<DemoProjectData.DemoUser>): Map<String, UserAccount> {
+    val usernames = demoUsers.map { it.username }
+    val existingUsers = userAccountRepository.findDemoByUsernames(usernames)
+    return demoUsers.associate { demoUser ->
+      val existingUser =
+        existingUsers.find { existingUser -> demoUser.username == existingUser.username }
+          ?: createDemoUser(demoUser)
+      demoUser.username to existingUser
+    }
+  }
+
+  private fun createDemoUser(demoUser: DemoProjectData.DemoUser): UserAccount {
+    val user = UserAccount()
+    user.username = demoUser.username
+    user.name = demoUser.name
+    user.isDemo = true
+    user.disabledAt = currentDateProvider.date
+
+    setDemoUserAvatar(demoUser, user)
+
+    return save(user)
+  }
+
+  private fun setDemoUserAvatar(
+    demoUser: DemoProjectData.DemoUser,
+    user: UserAccount,
+  ) {
+    val stream =
+      javaClass.getResourceAsStream("/demoProject/userAvatars/${demoUser.avatarFileName}")
+        ?: throw IllegalArgumentException("Demo user avatar doesn't exist")
+
+    avatarService.setAvatar(user, stream)
+  }
+
+  @Transactional
+  fun createUser(userAccount: UserAccount): UserAccount {
+    applicationEventPublisher.publishEvent(OnUserCreated(this, userAccount))
+    userAccountRepository.saveAndFlush(userAccount)
+    applicationEventPublisher.publishEvent(OnUserCountChanged(decrease = false, this))
+    return userAccount
+  }
+
+  @Transactional
+  fun createUserWithPassword(
+    userAccount: UserAccount,
+    rawPassword: String,
+  ): UserAccount {
+    userAccountRepository.saveAndFlush(userAccount)
+    userAccount.password = passwordEncoder.encode(rawPassword)
+    applicationEventPublisher.publishEvent(OnUserCreated(this, userAccount))
+    applicationEventPublisher.publishEvent(OnUserCountChanged(decrease = false, this))
+    return userAccount
+  }
+
+  @CacheEvict(Caches.USER_ACCOUNTS, key = "#id")
+  @Transactional
+  fun delete(id: Long) {
+    val user = this.get(id)
+    delete(user)
+    this.applicationEventPublisher.publishEvent(OnUserCountChanged(decrease = true, this))
+  }
+
+  @CacheEvict(Caches.USER_ACCOUNTS, key = "#userAccount.id")
+  @Transactional
+  fun delete(userAccount: UserAccount) {
+    traceLogMeasureTime("deleteUser") {
+      val toDelete =
+        userAccountRepository.findWithFetchedEmailVerificationAndPermissions(userAccount.id)
+          ?: throw NotFoundException()
+      deleteWithFetchedData(toDelete)
+    }
+  }
+
+  private fun deleteWithFetchedData(toDelete: UserAccount) {
+    oauth2AuthorizationService.revokeAllForUser(toDelete.id)
+    toDelete.emailVerification?.let {
+      entityManager.remove(it)
+    }
+    toDelete.apiKeys?.forEach {
+      entityManager.remove(it)
+    }
+    toDelete.pats?.forEach {
+      entityManager.remove(it)
+    }
+    toDelete.permissions.forEach {
+      entityManager.remove(it)
+    }
+    toDelete.preferences?.let {
+      entityManager.remove(it)
+    }
+    // Clear the reference to avoid Hibernate 6.6's CHECK_ON_FLUSH validation error
+    // when the removed preferences entity is still referenced by the UserAccount
+    toDelete.preferences = null
+    toDelete.invitations?.forEach {
+      entityManager.remove(it)
+    }
+    organizationService.getAllSingleOwnedByUser(toDelete).forEach {
+      it.preferredBy.removeIf { preferences ->
+        preferences.userAccount.id == toDelete.id
+      }
+      organizationService.delete(it)
+    }
+    toDelete.organizationRoles.forEach {
+      entityManager.remove(it)
+    }
+    aiPlaygroundResultService.deleteResultsByUser(toDelete.id)
+    userAccountRepository.softDeleteUser(toDelete, currentDateProvider.date)
+    applicationEventPublisher.publishEvent(OnUserCountChanged(decrease = true, this))
+    applicationEventPublisher.publishEvent(OnUserDeleted(this, toDelete))
+  }
+
+  @Transactional
+  fun deleteByUserNames(usernames: List<String>) {
+    val data = userAccountRepository.findActiveWithFetchedDataByUserNames(usernames)
+    data.forEach {
+      deleteWithFetchedData(it)
+      cacheManager.getCache(Caches.USER_ACCOUNTS)?.evict(it.id)
+    }
+  }
+
+  fun findByThirdParty(
+    type: ThirdPartyAuthType,
+    id: String,
+  ): UserAccount? {
+    return userAccountRepository.findThirdByThirdParty(id, type)
+  }
+
+  fun findEnabledBySsoDomain(
+    type: String,
+    idSub: String,
+  ): UserAccount? = userAccountRepository.findEnabledBySsoDomain(idSub, type)
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun setAccountType(
+    userAccount: UserAccount,
+    accountType: UserAccount.AccountType,
+  ): UserAccount {
+    userAccount.accountType = accountType
+    return userAccountRepository.save(userAccount)
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun setResetPasswordCode(
+    userAccount: UserAccount,
+    code: String?,
+  ): UserAccount {
+    userAccount.resetPasswordCode = passwordEncoder.encode(code)
+    return userAccountRepository.save(userAccount)
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun setUserPassword(
+    userAccount: UserAccount,
+    password: String?,
+  ): UserAccount {
+    revokeSessionsAndOAuthGrants(userAccount)
+    userAccount.password = passwordEncoder.encode(password)
+    return userAccountRepository.save(userAccount)
+  }
+
+  @Transactional
+  fun isResetCodeValid(
+    userAccount: UserAccount,
+    code: String?,
+  ): Boolean {
+    return passwordEncoder.matches(code, userAccount.resetPasswordCode)
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun removeResetCode(userAccount: UserAccount): UserAccount {
+    userAccount.resetPasswordCode = null
+    return userAccountRepository.save(userAccount)
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun enableMfaTotp(
+    userAccount: UserAccount,
+    key: ByteArray,
+    initialOtp: String,
+  ): UserAccount {
+    // Validate the OTP and seed `totpLastUsedTimeStep` from the matched step so
+    // the same code can't be replayed against the login endpoint immediately after enable.
+    val matchedStep =
+      mfaService.findMatchingTimeStep(key, initialOtp, minExclusiveTimeStep = null)
+        ?: throw ValidationException(Message.INVALID_OTP_CODE)
+    userAccount.totpKey = key
+    userAccount.totpLastUsedTimeStep = matchedStep
+    revokeSessionsAndOAuthGrants(userAccount)
+    val savedUser = userAccountRepository.save(userAccount)
+    notifySelf(userAccount, NotificationType.MFA_ENABLED)
+    return savedUser
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun disableMfaTotp(userAccount: UserAccount): UserAccount {
+    userAccount.totpKey = null
+    userAccount.totpLastUsedTimeStep = null
+    // note: if support for more MFA methods is added, this should be only done if no other MFA method is enabled
+    userAccount.mfaRecoveryCodes = emptyList()
+    revokeSessionsAndOAuthGrants(userAccount)
+    val savedUser = userAccountRepository.save(userAccount)
+    notifySelf(userAccount, NotificationType.MFA_DISABLED)
+    return savedUser
+  }
+
+  private fun notifySelf(
+    userAccount: UserAccount,
+    notificationType: NotificationType,
+  ) {
+    notificationService.notify(
+      Notification().apply {
+        this.user = userAccount
+        this.type = notificationType
+        this.originatingUser = userAccount
+      },
+    )
+  }
+
+  /**
+   * Verifies a TOTP code against [userAccount] and atomically advances the stored
+   * [UserAccount.totpLastUsedTimeStep] so the same (or earlier) time step cannot be accepted
+   * again. This enforces RFC 6238 §5.2 replay prevention on top of the ±1 drift tolerance
+   * in [MfaService.findMatchingTimeStep].
+   *
+   * Throws [AuthenticationException] with [Message.INVALID_OTP_CODE] on every failure mode:
+   * missing/empty TOTP key, no matching code in the allowed window, or a concurrent request
+   * that already bumped the counter at or past the matched step.
+   */
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun consumeTotpCode(
+    userAccount: UserAccount,
+    code: String,
+  ): UserAccount {
+    if (!MfaService.mfaEnabled(userAccount.totpKey)) {
+      throw AuthenticationException(Message.INVALID_OTP_CODE)
+    }
+    val key = userAccount.totpKey!!
+    val matchedStep =
+      mfaService.findMatchingTimeStep(key, code, userAccount.totpLastUsedTimeStep)
+        ?: throw AuthenticationException(Message.INVALID_OTP_CODE)
+    val rowsAffected =
+      userAccountRepository.updateTotpLastUsedTimeStepIfGreater(userAccount.id, matchedStep)
+    if (rowsAffected == 0) {
+      logger.warn(
+        "TOTP replay rejected for user {}: concurrent bump lost the race",
+        userAccount.id,
+      )
+      throw AuthenticationException(Message.INVALID_OTP_CODE)
+    }
+    // Keep the in-memory entity consistent for the remainder of this request.
+    userAccount.totpLastUsedTimeStep = matchedStep
+    return userAccount
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun consumeMfaRecoveryCode(
+    userAccount: UserAccount,
+    recoveryCode: String,
+  ): UserAccount {
+    if (!userAccount.mfaRecoveryCodes.contains(recoveryCode)) {
+      throw AuthenticationException(Message.INVALID_OTP_CODE)
+    }
+
+    userAccount.mfaRecoveryCodes = userAccount.mfaRecoveryCodes.minus(recoveryCode)
+
+    // Burn the current and next TOTP windows
+    val burnThrough = mfaService.currentTimeStep() + 1L
+    userAccount.totpLastUsedTimeStep = maxOf(burnThrough, userAccount.totpLastUsedTimeStep ?: burnThrough)
+    return userAccountRepository.save(userAccount)
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun setMfaRecoveryCodes(
+    userAccount: UserAccount,
+    codes: List<String>,
+  ): UserAccount {
+    userAccount.mfaRecoveryCodes = codes
+    return userAccountRepository.save(userAccount)
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#userAccount.id")
+  fun updateSsoSession(
+    userAccount: UserAccount,
+    refreshToken: String?,
+  ): UserAccount {
+    userAccount.ssoRefreshToken = refreshToken
+    userAccount.ssoSessionExpiry = getCurrentSsoExpiration(userAccount.thirdPartyAuthType)
+    return userAccountRepository.save(userAccount)
+  }
+
+  fun getCurrentSsoExpiration(type: ThirdPartyAuthType?): Date? {
+    return currentDateProvider.date.addMinutes(
+      when (type) {
+        ThirdPartyAuthType.SSO -> tolgeeProperties.authentication.ssoOrganizations.sessionExpirationMinutes
+        ThirdPartyAuthType.SSO_GLOBAL -> tolgeeProperties.authentication.ssoGlobal.sessionExpirationMinutes
+        else -> return null
+      },
+    )
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#userAccount.id")
+  fun removeAvatar(userAccount: UserAccount) {
+    avatarService.removeAvatar(userAccount)
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#userAccount.id")
+  fun setAvatar(
+    userAccount: UserAccount,
+    avatar: InputStream,
+  ) {
+    avatarService.setAvatar(userAccount, avatar)
+  }
+
+  fun getAllInOrganization(
+    organizationId: Long,
+    pageable: Pageable,
+    search: String?,
+  ): Page<UserAccountWithOrganizationRoleView> {
+    return userAccountRepository.getAllInOrganization(organizationId, pageable, search = search ?: "")
+  }
+
+  fun getAllInProject(
+    projectId: Long,
+    pageable: Pageable,
+    search: String?,
+    exceptUserId: Long? = null,
+    filters: UserAccountFilters = UserAccountFilters(),
+  ): Page<UserAccountInProjectView> {
+    return userAccountRepository.getAllInProject(
+      projectId,
+      pageable,
+      search = search,
+      exceptUserId,
+      filters,
+    )
+  }
+
+  fun getAllInProjectWithPermittedLanguages(
+    projectId: Long,
+    pageable: Pageable,
+    search: String?,
+    exceptUserId: Long? = null,
+    filters: UserAccountFilters = UserAccountFilters(),
+  ): Page<ExtendedUserAccountInProject> {
+    val users = getAllInProject(projectId, pageable, search, exceptUserId, filters)
+    val organizationBasePermission = organizationService.getProjectOwner(projectId = projectId).basePermission
+
+    val permittedLanguageMap =
+      permissionService.getPermittedTranslateLanguagesForUserIds(
+        users.content.map { it.id },
+        projectId,
+      )
+    return users.map {
+      ExtendedUserAccountInProject(
+        id = it.id,
+        name = it.name,
+        username = it.username,
+        organizationRole = it.organizationRole,
+        directPermission = it.directPermission,
+        organizationBasePermission = organizationBasePermission,
+        permittedLanguageIds = permittedLanguageMap[it.id],
+        mfaEnabled = it.isMfaEnabled,
+        avatarHash = it.avatarHash,
+      )
+    }
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun update(
+    userAccount: UserAccount,
+    dto: UserUpdateRequestDto,
+    request: HttpServletRequest,
+  ): UserAccount {
+    // Current password required to change email or password
+    if (dto.email != userAccount.username) {
+      if (userAccount.accountType == UserAccount.AccountType.MANAGED) {
+        throw BadRequestException(Message.OPERATION_UNAVAILABLE_FOR_ACCOUNT_TYPE)
+      }
+
+      if (dto.currentPassword?.isNotEmpty() != true) throw BadRequestException(Message.CURRENT_PASSWORD_REQUIRED)
+      val matches = passwordEncoder.matches(dto.currentPassword, userAccount.password)
+      if (!matches) throw BadRequestException(Message.WRONG_CURRENT_PASSWORD)
+    }
+
+    val old = UserAccountDto.fromEntity(userAccount)
+    updateUserEmail(userAccount, dto, request)
+    userAccount.name = dto.name
+
+    publishUserInfoUpdatedEvent(old, userAccount)
+    return userAccountRepository.save(userAccount)
+  }
+
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun updatePassword(
+    userAccount: UserAccount,
+    dto: UserUpdatePasswordRequestDto,
+  ): UserAccount {
+    if (userAccount.accountType == UserAccount.AccountType.MANAGED) {
+      throw BadRequestException(Message.OPERATION_UNAVAILABLE_FOR_ACCOUNT_TYPE)
+    }
+
+    val matches = passwordEncoder.matches(dto.currentPassword, userAccount.password)
+    if (!matches) throw PermissionException(Message.WRONG_CURRENT_PASSWORD)
+
+    revokeSessionsAndOAuthGrants(userAccount)
+    userAccount.password = passwordEncoder.encode(dto.password)
+    userAccount.passwordChanged = true
+    val savedUser = userAccountRepository.save(userAccount)
+    notifySelf(userAccount, NotificationType.PASSWORD_CHANGED)
+    return savedUser
+  }
+
+  private fun updateUserEmail(
+    userAccount: UserAccount,
+    dto: UserUpdateRequestDto,
+    request: HttpServletRequest,
+  ) {
+    val newEmail = dto.email.lowercase()
+    if (userAccount.username == newEmail) {
+      return
+    }
+
+    if (!emailValidator.isValid(newEmail, null)) {
+      // todo: Allow to specify STANDARD_VALIDATION typed errors to show errors on specific fields
+      throw ValidationException(Message.VALIDATION_EMAIL_IS_NOT_VALID)
+    }
+
+    this.findActive(newEmail)?.let { throw ValidationException(Message.USERNAME_ALREADY_EXISTS) }
+    if (tolgeeProperties.authentication.needsEmailVerification) {
+      emailVerificationService.resendEmailVerification(userAccount, request, dto.callbackUrl, newEmail)
+      return
+    }
+
+    userAccount.username = newEmail
+  }
+
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#userAccount.id")
+  fun invalidateTokens(userAccount: UserAccount): UserAccount {
+    revokeSessionsAndOAuthGrants(userAccount)
+    return userAccountRepository.save(userAccount)
+  }
+
+  private fun revokeSessionsAndOAuthGrants(userAccount: UserAccount) {
+    userAccount.tokensValidNotBefore = DateUtils.truncate(currentDateProvider.date, Calendar.SECOND)
+    oauth2AuthorizationService.revokeAllForUser(userAccount.id)
+  }
+
+  private fun publishUserInfoUpdatedEvent(
+    old: UserAccountDto,
+    userAccount: UserAccount,
+  ) {
+    val event = OnUserUpdated(this, old, UserAccountDto.fromEntity(userAccount))
+    applicationEventPublisher.publishEvent(event)
+  }
+
+  fun saveAll(userAccounts: Collection<UserAccount>): MutableList<UserAccount> =
+    userAccountRepository.saveAll(userAccounts)
+
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun save(user: UserAccount): UserAccount {
+    return userAccountRepository.save(user)
+  }
+
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#result.id")
+  fun saveAndFlush(user: UserAccount): UserAccount {
+    return userAccountRepository.saveAndFlush(user)
+  }
+
+  fun getAllByIdsIncludingDeleted(ids: Set<Long>): MutableList<UserAccount> {
+    return userAccountRepository.getAllByIdsIncludingDeleted(ids)
+  }
+
+  fun findAllWithDisabledPaged(
+    pageable: Pageable,
+    search: String?,
+  ): Page<UserAccount> {
+    return userAccountRepository.findAllWithDisabledPaged(search, pageable)
+  }
+
+  fun countAll(): Long {
+    return userAccountRepository.count()
+  }
+
+  fun countAllEnabled(): Long {
+    return userAccountRepository.countAllEnabled()
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#userId")
+  fun disable(
+    userId: Long,
+    actingAs: UserDisabledBy,
+  ) {
+    val user = userAccountRepository.findActiveOrDisabled(userId) ?: throw NotFoundException(Message.USER_NOT_FOUND)
+    checkOrganizationMayActOnAccount(user, actingAs)
+    if (user.disabledAt != null) {
+      takeOverDisable(user, actingAs)
+      return
+    }
+    user.disabledAt = currentDateProvider.date
+    user.disabledBy = actingAs
+    this.save(user)
+    this.applicationEventPublisher.publishEvent(OnUserCountChanged(decrease = true, this))
+  }
+
+  @Transactional
+  @CacheEvict(cacheNames = [Caches.USER_ACCOUNTS], key = "#userId")
+  fun enable(
+    userId: Long,
+    requestedBy: UserDisabledBy,
+  ): Boolean {
+    val user = userAccountRepository.findActiveOrDisabled(userId) ?: throw NotFoundException(Message.USER_NOT_FOUND)
+    if (user.disabledAt == null) return false
+    checkOrganizationMayActOnAccount(user, requestedBy)
+    if (!canOverrideDisable(user.disabledBy, requestedBy)) {
+      throw ValidationException(Message.USER_DISABLED_BY_ADMIN)
+    }
+    user.disabledAt = null
+    user.disabledBy = null
+    this.save(user)
+    this.applicationEventPublisher.publishEvent(OnUserCountChanged(decrease = false, this))
+    return true
+  }
+
+  private fun checkOrganizationMayActOnAccount(
+    user: UserAccount,
+    actingAs: UserDisabledBy,
+  ) {
+    if (actingAs == UserDisabledBy.ORGANIZATION && user.isSupporterOrAdmin()) {
+      throw ValidationException(Message.CANNOT_MANAGE_PLATFORM_STAFF_ACCOUNT)
+    }
+  }
+
+  private fun takeOverDisable(
+    user: UserAccount,
+    actingAs: UserDisabledBy,
+  ) {
+    if (user.disabledBy == actingAs) return
+    if (!canOverrideDisable(user.disabledBy, actingAs)) {
+      throw ValidationException(Message.USER_DISABLED_BY_ADMIN)
+    }
+    user.disabledBy = actingAs
+    this.save(user)
+  }
+
+  private fun canOverrideDisable(
+    storedDisabledBy: UserDisabledBy?,
+    requestedBy: UserDisabledBy,
+  ): Boolean {
+    if (requestedBy == UserDisabledBy.ADMIN) return true
+    return storedDisabledBy == UserDisabledBy.ORGANIZATION
+  }
+
+  fun transferLegacyNoAuthUser() {
+    val legacyImplicitUser =
+      findActive("___implicit_user")
+        ?: return
+
+    // We need to migrate what's owned by `___implicit_user` to the initial user
+    val initialUser = findInitialUser() ?: throw IllegalStateException("Initial user does not exist?")
+
+    // Collect entities to transfer before modifying collections
+    // This avoids issues with Hibernate 6.6's stricter orphanRemoval handling
+    val apiKeysToTransfer = legacyImplicitUser.apiKeys?.toList() ?: emptyList()
+    val patsToTransfer = legacyImplicitUser.pats?.toList() ?: emptyList()
+    val permissionsToTransfer = legacyImplicitUser.permissions.toList()
+    val organizationRolesToTransfer = legacyImplicitUser.organizationRoles.toList()
+    val preferencesToTransfer = legacyImplicitUser.preferences
+
+    // Detach the legacy user to prevent orphanRemoval from deleting reassigned entities
+    entityManager.detach(legacyImplicitUser)
+
+    // Transfer entities to the initial user
+    apiKeysToTransfer.forEach {
+      it.userAccount = initialUser
+      entityManager.merge(it)
+    }
+
+    patsToTransfer.forEach {
+      it.userAccount = initialUser
+      entityManager.merge(it)
+    }
+
+    permissionsToTransfer.forEach {
+      it.user = initialUser
+      entityManager.merge(it)
+    }
+
+    preferencesToTransfer?.let {
+      it.userAccount = initialUser
+      entityManager.merge(it)
+    }
+
+    organizationRolesToTransfer.forEach {
+      it.user = initialUser
+      entityManager.merge(it)
+    }
+
+    entityManager.flush()
+    userAccountRepository.save(initialUser)
+
+    // Re-fetch and delete the legacy user (it's detached so we need to get it fresh)
+    findActive("___implicit_user")?.let {
+      userAccountRepository.deleteById(it.id)
+    }
+  }
+
+  fun findActiveView(id: Long): UserAccountView? = userAccountRepository.findActiveView(id)
+
+  fun findWithMinimalPermissions(
+    filters: UserAccountPermissionsFilters,
+    projectId: Long,
+    search: String?,
+    pageable: Pageable,
+  ): PageImpl<UserAccount> {
+    val ids =
+      userAccountRepository.findUsersWithMinimalPermissions(
+        filters.filterId ?: listOf(),
+        filters.filterMinimalScopeExtended,
+        filters.filterMinimalPermissionType,
+        projectId,
+        filters.filterViewLanguageId,
+        filters.filterEditLanguageId,
+        filters.filterStateLanguageId,
+        search,
+        pageable,
+      )
+    return PageImpl(userAccountRepository.findAllById(ids.content), pageable, ids.totalElements)
+  }
+}

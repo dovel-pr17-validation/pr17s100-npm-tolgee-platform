@@ -1,0 +1,375 @@
+package io.tolgee.repository
+
+import io.tolgee.dtos.queryResults.qa.KeyLanguagePairView
+import io.tolgee.jobs.migration.translationStats.StatsMigrationTranslationView
+import io.tolgee.model.Project
+import io.tolgee.model.key.Key
+import io.tolgee.model.translation.Translation
+import io.tolgee.model.views.SimpleTranslationView
+import io.tolgee.model.views.TranslationMemoryItemView
+import org.springframework.context.annotation.Lazy
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.Pageable
+import org.springframework.data.jpa.repository.JpaRepository
+import org.springframework.data.jpa.repository.Modifying
+import org.springframework.data.jpa.repository.Query
+import org.springframework.stereotype.Repository
+import java.util.Date
+import java.util.Optional
+
+@Repository
+@Lazy
+interface TranslationRepository : JpaRepository<Translation, Long> {
+  @Query(
+    """select t.text as text, l.tag as languageTag, k.name as key
+        from Translation t
+        join t.key k
+        left join k.branch b
+        left join k.namespace n
+        left join k.keyMeta km
+        left join km.tags kmt
+        join t.language l
+        where t.key.project.id = :projectId
+         and k.deletedAt is null
+         and ((b.name = :branch and b.deletedAt is null) or (:branch is null and (b is null or b.isDefault)))
+         and l.tag in :languages
+         and ((n.name is null and :namespace is null) or n.name = :namespace)
+         and (:filterTags is null or kmt.name in :filterTags)
+        group by t.id, l.tag, k.name
+        order by k.name
+   """,
+  )
+  fun getTranslations(
+    languages: Set<String>,
+    namespace: String?,
+    branch: String?,
+    projectId: Long,
+    filterTags: List<String>?,
+  ): List<SimpleTranslationView>
+
+  @Query(
+    "from Translation t " +
+      "join fetch Key k on t.key = k " +
+      "where k = :key and k.project = :project and t.language.id in :languageIds",
+  )
+  fun getTranslations(
+    key: Key,
+    project: Project,
+    languageIds: Collection<Long>,
+  ): Set<Translation>
+
+  fun findOneByKeyAndLanguageId(
+    key: Key,
+    languageId: Long,
+  ): Optional<Translation>
+
+  fun findAllByKey(key: Key): List<Translation>
+
+  @Query(
+    """
+    from Translation t 
+    join fetch t.key k
+    where t.key.id = :keyId and k.project.id = :projectId and t.language.id = :languageId
+  """,
+  )
+  fun findOneByProjectIdAndKeyIdAndLanguageId(
+    projectId: Long,
+    keyId: Long,
+    languageId: Long,
+  ): Translation?
+
+  @Query(
+    """
+    select b.id
+    from Translation t
+    join t.key k
+    left join k.branch b
+    where t.id in :ids
+  """,
+  )
+  fun getBranchIdsByIds(ids: Collection<Long>): List<Long?>
+
+  @Query(
+    """
+        select t from Translation t
+        join fetch t.key k
+        left join k.branch b
+        left join fetch k.keyMeta
+        where t.language.id = :languageId
+        and k.deletedAt is null
+        and ((b.name = :branch and b.deletedAt is null) or (:branch is null and (b is null or b.isDefault)))
+    """,
+  )
+  fun getAllByLanguageId(
+    languageId: Long,
+    branch: String?,
+  ): List<Translation>
+
+  @Query(
+    """from Translation t 
+    join fetch t.key k 
+    left join fetch k.keyMeta 
+    left join fetch t.comments
+    where t.key.id in :keyIds""",
+  )
+  fun getAllByKeyIdIn(keyIds: Collection<Long>): Collection<Translation>
+
+  @Query(
+    """from Translation t 
+    join fetch t.key k 
+    left join fetch k.keyMeta 
+    left join fetch t.comments
+    where t.key.id in :keyIds
+    and (:excludeTranslationIds is null or t.id not in :excludeTranslationIds)
+    """,
+  )
+  fun getAllByKeyIdInExcluding(
+    keyIds: Collection<Long>,
+    excludeTranslationIds: List<Long>? = null,
+  ): Collection<Translation>
+
+  fun deleteByIdIn(ids: Collection<Long>)
+
+  /**
+   * Exact-equality auto-translate lookup. Returns up to [pageable.size] translations whose
+   * key has a base-language translation equal to [baseTranslationText]. Used by the batch /
+   * MT pre-translate pipeline: the trigram-similarity suggestion query in
+   * `AbstractTranslationMemoryService` is too slow to run per-key, so the hot path resolves
+   * exact matches here and falls back to MT for the rest.
+   *
+   * The md5 probe goes through `sql()` because HQL `md5` renders as `decode(md5(..), 'hex')`,
+   * which doesn't match the `ix_translation_lang_text_md5` expression.
+   */
+  @Query(
+    """
+      select
+      new io.tolgee.model.views.TranslationMemoryItemView(baseTranslation.text, target.text, k.name, null, 1.0f, k.id)
+      from Translation baseTranslation
+      join baseTranslation.key k
+      left join k.branch b
+      join Translation target on
+            target.key = k and
+            target.language.id = :targetLanguageId and
+            target.text <> '' and
+            target.text is not null
+      where baseTranslation.language.id = :baseLanguageId and
+        sql('md5(?)::uuid', baseTranslation.text) = sql('md5(?)::uuid', :baseTranslationText) and
+        baseTranslation.text = :baseTranslationText and
+        k <> :key and
+        k.deletedAt is null and
+        (b is null or b.isDefault = true)
+      order by case when target.state = io.tolgee.model.enums.TranslationState.REVIEWED then 0 else 1 end,
+        target.updatedAt desc, target.id desc
+      """,
+  )
+  fun getTranslationMemoryValue(
+    baseTranslationText: String,
+    key: Key,
+    baseLanguageId: Long,
+    targetLanguageId: Long,
+    pageable: Pageable = Pageable.ofSize(1),
+  ): List<TranslationMemoryItemView>
+
+  @Query(
+    """
+    select t.id as id, t.text as text, t.language.tag as languageTag
+    from Translation t
+  """,
+  )
+  fun findAllForStatsUpdate(pageable: Pageable): Page<StatsMigrationTranslationView>
+
+  @Query(
+    """
+    select t.id
+    from Translation t
+    where t.text is not null and (t.wordCount is null or t.characterCount is null or (length(text) <> 0 and t.characterCount = 0))
+    order by t.id
+  """,
+  )
+  fun findAllIdsForStatsUpdate(): List<Long>
+
+  @Query(
+    """
+    update Translation t
+    set t.outdated = true
+    where t.id in (
+      select t.id
+      from Translation t
+      join t.key k on k.id in :keyIds
+      join k.project p
+      where t.language.id <> p.baseLanguage.id
+    )
+  """,
+  )
+  @Modifying
+  fun setOutdated(keyIds: List<Long>)
+
+  @Query(
+    """
+    select t from Translation t
+    join t.language l on l.tag in :languageTags
+    where t.key.id in :keys
+  """,
+  )
+  fun getForKeys(
+    keys: List<Long>,
+    languageTags: List<String>,
+  ): List<Translation>
+
+  fun findAllByKeyIdInAndLanguageIdIn(
+    keysIds: List<Long>,
+    languagesIds: List<Long>,
+  ): List<Translation>
+
+  @Query(
+    """
+    from Translation t
+    join fetch t.key
+    join fetch t.language
+    where t.key.id in :keyIds and t.language.id in :languageIds
+    """,
+  )
+  fun findAllWithKeyAndLanguageByKeyIdInAndLanguageIdIn(
+    keyIds: Collection<Long>,
+    languageIds: Collection<Long>,
+  ): List<Translation>
+
+  @Query(
+    """
+    select new io.tolgee.dtos.queryResults.qa.KeyLanguagePairView(k.id, t.language.id)
+    from Translation t
+    join t.key k
+    where k.project.id = :projectId
+      and k.branch.id = :branchId
+      and t.language.id in :languageIds
+      and t.qaChecksStale = true
+    """,
+  )
+  fun getStaleKeyLanguagePairsByBranchAndLanguageIds(
+    projectId: Long,
+    branchId: Long,
+    languageIds: Collection<Long>,
+  ): List<KeyLanguagePairView>
+
+  @Query(
+    """
+    select new io.tolgee.dtos.queryResults.qa.KeyLanguagePairView(k.id, t.language.id)
+    from Translation t
+    join t.key k
+    where k.project.id = :projectId
+      and t.language.id in :languageIds
+      and t.qaChecksStale = true
+    """,
+  )
+  fun getStaleKeyLanguagePairsByProjectAndLanguageIds(
+    projectId: Long,
+    languageIds: Collection<Long>,
+  ): List<KeyLanguagePairView>
+
+  @Query(
+    """
+    select t from Translation t
+    join t.key k
+    where k.project.id = :projectId
+  """,
+  )
+  fun getAllByProjectId(projectId: Long): List<Translation>
+
+  @Query(
+    """
+    from Translation t
+    where t.key = :key and t.language.tag in :languageTags and t.language.deletedAt is null
+  """,
+  )
+  fun findForKeyByLanguages(
+    key: Key,
+    languageTags: Collection<String>,
+  ): List<Translation>
+
+  @Query(
+    """
+    from Translation t where t.key.project.id = :projectId and t.id = :translationId
+  """,
+  )
+  fun find(
+    projectId: Long,
+    translationId: Long,
+  ): Translation?
+
+  @Query("select max(coalesce(t.updatedAt, t.createdAt)) from Translation t where t.language.id = :languageId")
+  fun getLastModifiedDate(languageId: Long): Date?
+
+  @Query(
+    """
+    SELECT t FROM Translation t
+    LEFT JOIN FETCH t.labels
+    WHERE t.key.id IN :keyIds AND t.language.id IN :languageIds
+    """,
+  )
+  fun getTranslationsWithLabels(
+    keyIds: Collection<Long>,
+    languageIds: Collection<Long>,
+  ): List<Translation>
+
+  @Modifying(flushAutomatically = false)
+  @Query(
+    nativeQuery = true,
+    value =
+      "UPDATE translation SET qa_checks_stale = true " +
+        "WHERE key_id IN (SELECT id FROM key WHERE project_id = :projectId) " +
+        "AND qa_checks_stale = false",
+  )
+  fun setQaChecksStaleByProjectId(projectId: Long)
+
+  @Modifying(flushAutomatically = false)
+  @Query(
+    nativeQuery = true,
+    value =
+      "UPDATE translation SET qa_checks_stale = true " +
+        "WHERE key_id IN (SELECT id FROM key WHERE project_id = :projectId) " +
+        "AND language_id IN (:languageIds) " +
+        "AND qa_checks_stale = false",
+  )
+  fun setQaChecksStaleByProjectIdAndLanguageIds(
+    projectId: Long,
+    languageIds: List<Long>,
+  )
+
+  @Modifying(flushAutomatically = false)
+  @Query(
+    nativeQuery = true,
+    value =
+      "UPDATE translation SET qa_checks_stale = true " +
+        "WHERE id IN (:ids) AND qa_checks_stale = false",
+  )
+  fun setQaChecksStaleByIds(ids: Collection<Long>)
+
+  @Modifying(flushAutomatically = false)
+  @Query(
+    nativeQuery = true,
+    value =
+      "UPDATE translation SET qa_checks_stale = true " +
+        "WHERE key_id IN (:keyIds) AND qa_checks_stale = false",
+  )
+  fun setQaChecksStaleByKeyIds(keyIds: Collection<Long>)
+
+  // Ids bound as a single bigint[] (= ANY(:translationIds)) to stay under
+  // PostgreSQL's 65,535 prepared-statement parameter limit at chunk sizes that
+  // would otherwise expand to that many placeholders.
+  @Modifying(flushAutomatically = false)
+  @Query(
+    nativeQuery = true,
+    value =
+      "UPDATE translation SET qa_checks_stale = true " +
+        "WHERE key_id IN (" +
+        "  SELECT key_id FROM translation " +
+        "  WHERE id = ANY(:translationIds) AND language_id = :baseLanguageId" +
+        ") " +
+        "AND language_id <> :baseLanguageId " +
+        "AND qa_checks_stale = false",
+  )
+  fun setQaChecksStaleForBaseTranslationKeys(
+    translationIds: LongArray,
+    baseLanguageId: Long,
+  )
+}

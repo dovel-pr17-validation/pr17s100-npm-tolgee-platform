@@ -1,0 +1,329 @@
+/**
+ * Copyright (C) 2023 Tolgee s.r.o. and contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *         http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.tolgee.security.ratelimit
+
+import io.tolgee.Metrics
+import io.tolgee.component.CurrentDateProvider
+import io.tolgee.component.LockingProvider
+import io.tolgee.component.ResilientCacheAccessor
+import io.tolgee.configuration.tolgee.RateLimitProperties
+import io.tolgee.constants.Caches
+import io.tolgee.security.authentication.AuthenticationFacade
+import jakarta.servlet.http.HttpServletRequest
+import org.springframework.cache.Cache
+import org.springframework.cache.CacheManager
+import org.springframework.context.annotation.Lazy
+import org.springframework.stereotype.Service
+import java.time.Duration
+import java.util.concurrent.ConcurrentHashMap
+
+@Service
+class RateLimitService(
+  private val cacheManager: CacheManager,
+  private val lockingProvider: LockingProvider,
+  private val currentDateProvider: CurrentDateProvider,
+  private val rateLimitProperties: RateLimitProperties,
+  @Lazy
+  private val authenticationFacade: AuthenticationFacade,
+  private val resilientCacheAccessor: ResilientCacheAccessor,
+  private val metrics: Metrics,
+) {
+  private val cache: Cache by lazy {
+    cacheManager.getCache(Caches.RATE_LIMITS)
+      ?: throw RuntimeException("Could not initialize cache!")
+  }
+
+  private val inFlightConsumers = ConcurrentHashMap<String, Int>()
+
+  /**
+   * Consumes a token from the provided rate limit policy.
+   *
+   * @param policy The rate limit policy.
+   * @throws RateLimitedException There are no longer any tokens in the bucket.
+   */
+  fun consumeBucket(policy: RateLimitPolicy?) {
+    consumeBucketUnless(policy) { false }
+  }
+
+  /**
+   * Consumes a token from the provided rate limit policy unless a condition is met.
+   * The bucket must contain at least 1 token even if the condition would evaluate to true.
+   * The condition can throw, and the result will be considered "false".
+   *
+   * @param policy The rate limit policy.
+   * @throws RateLimitedException There are no longer any tokens in the bucket.
+   * @throws RateLimitBlockedException The client has exceeded the maximum strike count.
+   */
+  fun consumeBucketUnless(
+    policy: RateLimitPolicy?,
+    cond: () -> Boolean,
+  ) {
+    if (policy == null) return
+
+    val lockName = getLockName(policy)
+    val concurrent = inFlightConsumers.merge(lockName, 1, Int::plus)!!
+    try {
+      val maxConcurrent = rateLimitProperties.maxConcurrentPerBucket
+      if (maxConcurrent > 0 && concurrent > maxConcurrent) {
+        rejectWithoutConsuming(policy, "concurrency_cap")
+      }
+
+      lockingProvider.tryWithLocking(lockName, Duration.ofMillis(rateLimitProperties.lockWaitMs)) {
+        val bucket = resilientCacheAccessor.get(cache, policy.bucketName, Bucket::class.java)
+        try {
+          val consumed = doConsumeBucket(policy, bucket)
+          try {
+            if (!cond()) {
+              cache.put(policy.bucketName, consumed)
+            }
+          } catch (e: Exception) {
+            cache.put(policy.bucketName, consumed)
+            throw e
+          }
+        } catch (e: RateLimitedException) {
+          updateCacheWithStrike(policy.bucketName, bucket, e.strikeCount, e.lastStrikeAt)
+          throw e
+        } catch (e: RateLimitBlockedException) {
+          updateCacheWithStrike(policy.bucketName, bucket, e.strikeCount, e.lastStrikeAt)
+          throw e
+        }
+      } ?: rejectWithoutConsuming(policy, "lock_timeout")
+    } finally {
+      inFlightConsumers.compute(lockName) { _, count ->
+        when {
+          count == null || count <= 1 -> null
+          else -> count - 1
+        }
+      }
+    }
+  }
+
+  /**
+   * Rejects a request due to bucket contention, without touching the bucket itself.
+   * No strike is recorded — the bucket cannot be read or written safely without holding the lock.
+   */
+  private fun rejectWithoutConsuming(
+    policy: RateLimitPolicy,
+    reason: String,
+  ): Nothing {
+    metrics.rateLimitConcurrencyRejectionsCounter(reason).increment()
+    throw RateLimitedException(rateLimitProperties.lockWaitMs, policy.global)
+  }
+
+  /**
+   * Returns the global per-ip rate limit policy applicable to the request.
+   *
+   * @param request The HTTP request.
+   * @return The applicable rate limit policy, if any.
+   */
+  fun consumeGlobalIpRateLimitPolicy(request: HttpServletRequest) {
+    @Suppress("DEPRECATION") // TODO: remove for Tolgee 4 release
+    if (!rateLimitProperties.enabled) return
+    if (!rateLimitProperties.globalLimits) return
+
+    consumeBucket(
+      RateLimitPolicy(
+        "global.ip.${request.remoteAddr}",
+        rateLimitProperties.ipRequestLimit,
+        Duration.ofMillis(rateLimitProperties.ipRequestWindow),
+        true,
+      ),
+    )
+  }
+
+  /**
+   * Consumes a bucket according to the global per-user rate limit policy applicable to the request.
+   *
+   * @param request The HTTP request.
+   * @param userId The authenticated user ID.
+   * @return The applicable rate limit policy, if any.
+   */
+  fun consumeGlobalUserRateLimitPolicy(
+    request: HttpServletRequest,
+    userId: Long,
+  ) {
+    @Suppress("DEPRECATION") // TODO: remove for Tolgee 4 release
+    if (!rateLimitProperties.enabled) return
+    if (!rateLimitProperties.globalLimits) return
+
+    consumeBucket(
+      RateLimitPolicy(
+        "global.user.$userId",
+        rateLimitProperties.userRequestLimit,
+        Duration.ofMillis(rateLimitProperties.userRequestWindow),
+        true,
+      ),
+    )
+  }
+
+  /**
+   * Returns the per-ip rate limit policy applicable to the authentication phase.
+   *
+   * @param request The HTTP request.
+   * @return The applicable rate limit policy, if any.
+   */
+  fun getIpAuthRateLimitPolicy(request: HttpServletRequest): RateLimitPolicy? {
+    @Suppress("DEPRECATION") // TODO: remove for Tolgee 4 release
+    if (!rateLimitProperties.enabled) return null
+    if (!rateLimitProperties.authenticationLimits) return null
+
+    return RateLimitPolicy(
+      "global.ip.${request.remoteAddr}::auth",
+      5,
+      Duration.ofSeconds(1),
+      true,
+    )
+  }
+
+  fun getEmailVerificationIpRateLimitPolicy(
+    request: HttpServletRequest,
+    email: String?,
+  ): RateLimitPolicy? {
+    if (!rateLimitProperties.emailVerificationRequestLimitEnabled || email.isNullOrEmpty()) return null
+
+    val ip = request.remoteAddr
+    val key = "global.ip.$ip::email_verification"
+
+    return RateLimitPolicy(
+      key,
+      rateLimitProperties.emailVerificationRequestLimit,
+      Duration.ofMillis(rateLimitProperties.emailVerificationRequestWindow),
+      false,
+    )
+  }
+
+  /**
+   * Determines whether rate limiting should be applied based on the configuration and the
+   * type of operation (authentication or regular endpoint access).
+   *
+   * @param isAuthentication Indicates if the request is an authentication operation.
+   *                          If true, checks the rate limiting configuration for authentication operations.
+   *                          If false, checks the rate limiting configuration for regular endpoint operations.
+   */
+  fun shouldRateLimit(isAuthentication: Boolean): Boolean {
+    @Suppress("DEPRECATION") // TODO: remove for Tolgee 4 release
+    if (!rateLimitProperties.enabled) return false
+
+    return (isAuthentication && rateLimitProperties.authenticationLimits) ||
+      (!isAuthentication && rateLimitProperties.endpointLimits)
+  }
+
+  fun checkPerUserRateLimit(
+    bucketName: String,
+    limit: Int,
+    refillDuration: Duration = Duration.ofMinutes(1),
+  ) {
+    if (!shouldRateLimit(false)) {
+      return
+    }
+
+    val userAccount = authenticationFacade.authenticatedUserOrNull ?: return
+
+    val policy =
+      RateLimitPolicy(
+        "$bucketName::user.${userAccount.id}",
+        limit,
+        refillDuration,
+        false,
+      )
+
+    consumeBucket(policy)
+  }
+
+  /**
+   * Consumes a token from a bucket according to the rate limit policy.
+   *
+   * @param policy The rate limit policy.
+   * @param bucket The bucket to consume. Can be null or expired.
+   * @return The updated rate limit bucket.
+   * @throws RateLimitedException There are no longer any tokens in the bucket.
+   * @throws RateLimitBlockedException The client has exceeded the maximum strike count.
+   */
+  private fun doConsumeBucket(
+    policy: RateLimitPolicy,
+    bucket: Bucket?,
+  ): Bucket {
+    val time = currentDateProvider.date.time
+    if (bucket == null || bucket.refillAt < time) {
+      val tokensRemaining = policy.limit - 1
+      val tokensResetAt = policy.refillDuration.toMillis() + time
+
+      // Preserve or reset strikes based on time window
+      val (newStrikeCount, newLastStrikeAt) =
+        if (shouldResetStrikes(bucket?.lastStrikeAt, time)) {
+          0 to 0L
+        } else {
+          bucket!!.strikeCount to bucket.lastStrikeAt
+        }
+
+      return Bucket(tokensRemaining, tokensResetAt, newStrikeCount, newLastStrikeAt)
+    }
+
+    if (bucket.tokens == 0) {
+      val currentStrikes =
+        if (shouldResetStrikes(bucket.lastStrikeAt, time)) 0 else bucket.strikeCount
+
+      val newStrikeCount = currentStrikes + 1
+      val maxStrikes = rateLimitProperties.maxStrikesBeforeBlock
+
+      // If max strikes exceeded and feature is enabled (maxStrikes > 0), block the client
+      if (maxStrikes > 0 && newStrikeCount > maxStrikes) {
+        throw RateLimitBlockedException(newStrikeCount, time)
+      }
+
+      throw RateLimitedException(bucket.refillAt - time, policy.global, newStrikeCount, time)
+    }
+
+    return Bucket(bucket.tokens - 1, bucket.refillAt, bucket.strikeCount, bucket.lastStrikeAt)
+  }
+
+  /**
+   * Persists strike information to the cache when a rate limit exception is thrown.
+   * When bucket is null (rare edge case), creates a bucket with zero tokens to store the strike.
+   */
+  private fun updateCacheWithStrike(
+    bucketName: String,
+    bucket: Bucket?,
+    strikeCount: Int,
+    lastStrikeAt: Long,
+  ) {
+    val updatedBucket =
+      Bucket(
+        tokens = bucket?.tokens ?: 0,
+        refillAt = bucket?.refillAt ?: 0L,
+        strikeCount = strikeCount,
+        lastStrikeAt = lastStrikeAt,
+      )
+    cache.put(bucketName, updatedBucket)
+  }
+
+  /**
+   * Determines if strikes should be reset based on the time window.
+   * Strikes reset if there's no previous strike or if enough time has passed since the last one.
+   */
+  private fun shouldResetStrikes(
+    lastStrikeAt: Long?,
+    currentTime: Long,
+  ): Boolean {
+    if (lastStrikeAt == null || lastStrikeAt <= 0) return true
+    return (currentTime - lastStrikeAt) >= rateLimitProperties.strikeResetWindowMs
+  }
+
+  private fun getLockName(policy: RateLimitPolicy): String {
+    return "tolgee.ratelimit.${policy.bucketName}"
+  }
+}

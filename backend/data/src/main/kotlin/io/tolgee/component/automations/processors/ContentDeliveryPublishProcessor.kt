@@ -1,0 +1,58 @@
+package io.tolgee.component.automations.processors
+
+import io.tolgee.activity.ActivityService
+import io.tolgee.batch.ChunkItemFailedException
+import io.tolgee.component.automations.AutomationProcessor
+import io.tolgee.component.contentDelivery.ContentDeliveryUploader
+import io.tolgee.constants.Message
+import io.tolgee.exceptions.FileStoreException
+import io.tolgee.model.automations.AutomationAction
+import org.springframework.stereotype.Component
+
+@Component
+class ContentDeliveryPublishProcessor(
+  val contentDeliveryUploader: ContentDeliveryUploader,
+  val activityService: ActivityService,
+) : AutomationProcessor {
+  override fun process(
+    action: AutomationAction,
+    activityRevisionId: Long?,
+  ) {
+    try {
+      val config =
+        action.contentDeliveryConfig
+          ?: throw IllegalStateException("Wrong params passed to content delivery publish processor")
+
+      if (!isOnConfigBranch(activityRevisionId, config.branch?.id)) {
+        return
+      }
+
+      contentDeliveryUploader.upload(contentDeliveryConfigId = config.id)
+    } catch (e: Throwable) {
+      when (e) {
+        is FileStoreException -> throw ChunkItemFailedException(
+          Message.CANNOT_STORE_FILE_TO_CONTENT_STORAGE,
+          cause = e,
+        )
+
+        else -> throw ChunkItemFailedException(
+          Message.UNEXPECTED_ERROR_WHILE_PUBLISHING_TO_CONTENT_STORAGE,
+          cause = e,
+          delayInMs = 60000,
+          increaseFactor = 10,
+          maxRetries = 2,
+        )
+      }
+    }
+  }
+
+  private fun isOnConfigBranch(
+    activityRevisionId: Long?,
+    configBranchId: Long?,
+  ): Boolean {
+    if (activityRevisionId == null || configBranchId == null) {
+      return true
+    }
+    return activityService.hasModifiedEntitiesOnBranch(activityRevisionId, configBranchId)
+  }
+}

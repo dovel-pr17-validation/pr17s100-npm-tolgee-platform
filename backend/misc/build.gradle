@@ -1,0 +1,46 @@
+/*
+ * Copyright (c) 2020. Tolgee
+ */
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+}
+
+plugins {
+    id 'java'
+    id 'org.jetbrains.kotlin.jvm'
+}
+
+group = 'io.tolgee'
+
+apply plugin: 'java'
+apply plugin: 'idea'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(javaVersion.toInteger())
+    }
+}
+
+kotlin {
+    compilerOptions {
+        freeCompilerArgs.addAll("-Xjsr305=strict", "-Xannotation-default-target=param-property")
+    }
+}
+
+dependencies {
+    implementation libs.kotlinCoroutines
+    implementation libs.jacksonModuleKotlin
+    ktlint(project(":ktlint"))
+}
+
+sourceSets {
+    main.kotlin.srcDirs = ['src/main/kotlin', 'src/main/java']
+    test.kotlin.srcDirs = ['src/test/kotlin', 'src/test/java']
+}
+
+tasks.named('jar', Jar) {
+    duplicatesStrategy(DuplicatesStrategy.EXCLUDE)
+}

@@ -1,0 +1,125 @@
+/*
+ * Copyright (c) 2020. Tolgee
+ */
+
+package io.tolgee.api.v2.controllers
+
+import io.swagger.v3.oas.annotations.Operation
+import io.swagger.v3.oas.annotations.tags.Tag
+import io.tolgee.constants.Feature
+import io.tolgee.hateoas.project.stats.LanguageStatsModelAssembler
+import io.tolgee.hateoas.project.stats.ProjectStatsModel
+import io.tolgee.model.enums.Scope
+import io.tolgee.model.enums.qa.QaCheckType
+import io.tolgee.security.ProjectHolder
+import io.tolgee.security.authentication.AllowApiAccess
+import io.tolgee.security.authentication.ReadOnlyOperation
+import io.tolgee.security.authorization.RequiresFeatures
+import io.tolgee.security.authorization.RequiresProjectPermissions
+import io.tolgee.security.authorization.UseDefaultPermissions
+import io.tolgee.service.branching.BranchService
+import io.tolgee.service.language.LanguageService
+import io.tolgee.service.project.LanguageStatsService
+import io.tolgee.service.project.ProjectFeatureGuard
+import io.tolgee.service.project.ProjectService
+import io.tolgee.service.project.ProjectStatsService
+import io.tolgee.service.qa.TranslationQaIssueService
+import io.tolgee.service.security.SecurityService
+import org.springframework.http.MediaType
+import org.springframework.web.bind.annotation.CrossOrigin
+import org.springframework.web.bind.annotation.GetMapping
+import org.springframework.web.bind.annotation.RequestMapping
+import org.springframework.web.bind.annotation.RequestParam
+import org.springframework.web.bind.annotation.RestController
+import java.time.LocalDate
+
+@Suppress("MVCPathVariableInspection")
+@RestController
+@CrossOrigin(origins = ["*"])
+@RequestMapping(value = ["/v2/projects/{projectId:[0-9]+}/stats", "/v2/projects/stats"])
+@Tag(name = "Project Stats")
+class ProjectStatsController(
+  private val projectStatsService: ProjectStatsService,
+  private val projectHolder: ProjectHolder,
+  private val projectService: ProjectService,
+  private val languageStatsService: LanguageStatsService,
+  private val languageStatsModelAssembler: LanguageStatsModelAssembler,
+  private val languageService: LanguageService,
+  private val branchService: BranchService,
+  private val projectFeatureGuard: ProjectFeatureGuard,
+  private val translationQaIssueService: TranslationQaIssueService,
+  private val securityService: SecurityService,
+) {
+  @Operation(summary = "Get project stats")
+  @GetMapping("", produces = [MediaType.APPLICATION_JSON_VALUE])
+  @UseDefaultPermissions
+  @AllowApiAccess
+  fun getProjectStats(
+    @RequestParam(name = "branch", required = false) branchName: String? = null,
+  ): ProjectStatsModel {
+    projectFeatureGuard.checkIfUsed(Feature.BRANCHING, branchName)
+    val branch = branchService.getActiveOrDefault(projectHolder.project.id, branchName)
+    val projectStats = projectStatsService.getProjectStats(projectHolder.project.id, branch?.id)
+    val baseLanguage = projectService.getOrAssignBaseLanguage(projectHolder.project.id)
+    val languages = languageService.getProjectLanguages(projectHolder.project.id).associateBy { it.id }
+    val languageStats =
+      languageStatsService
+        .getLanguageStats(projectHolder.project.id, languages.keys, branch?.id)
+        .sortedBy { languages[it.languageId]?.name }
+        .sortedBy { languages[it.languageId]?.base == false }
+
+    val totals = projectStatsService.computeProjectTotals(baseLanguage, languageStats)
+
+    val statsLanguagePairs =
+      languageStats.mapNotNull {
+        val language = languages[it.languageId] ?: return@mapNotNull null
+        it to language
+      }
+
+    return ProjectStatsModel(
+      projectId = projectStats.id,
+      languageCount = languageStats.size,
+      keyCount = projectStats.keyCount,
+      taskCount = projectStats.taskCount,
+      baseWordsCount = totals.baseWordsCount,
+      hostedWordsCount = totals.hostedWordsCount,
+      translatedPercentage = totals.translatedPercent,
+      reviewedPercentage = totals.reviewedPercent,
+      membersCount = visibleMembersCount(projectStats.memberCount),
+      tagCount = projectStats.tagCount,
+      languageStats =
+        statsLanguagePairs.map {
+          languageStatsModelAssembler.toModel(it)
+        },
+    )
+  }
+
+  @Operation(summary = "Get QA issue counts grouped by check type for a language")
+  @GetMapping("/qa-issue-counts")
+  @ReadOnlyOperation
+  @UseDefaultPermissions
+  @AllowApiAccess
+  @RequiresFeatures(Feature.QA_CHECKS)
+  fun getQaIssueCountsByCheckType(
+    @RequestParam(name = "languageId") languageId: Long,
+    @RequestParam(name = "branch", required = false) branchName: String? = null,
+  ): Map<QaCheckType, Long> {
+    projectFeatureGuard.checkIfUsed(Feature.BRANCHING, branchName)
+    val branch = branchService.getActiveOrDefault(projectHolder.project.id, branchName)
+    return translationQaIssueService
+      .getOpenIssueCountsByCheckType(projectHolder.project.id, languageId, branch?.id)
+  }
+
+  @Operation(summary = "Get project daily amount of events")
+  @GetMapping("/daily-activity")
+  @RequiresProjectPermissions([Scope.ACTIVITY_VIEW])
+  @AllowApiAccess
+  fun getProjectDailyActivity(): Map<LocalDate, Long> {
+    return projectStatsService.getProjectDailyActivity(projectHolder.project.id)
+  }
+
+  private fun visibleMembersCount(memberCount: Long): Long {
+    if (!securityService.shouldExposeMemberInfo()) return 0
+    return memberCount
+  }
+}

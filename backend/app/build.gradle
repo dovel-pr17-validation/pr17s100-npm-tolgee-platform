@@ -1,0 +1,384 @@
+/*
+ * Copyright (c) 2020. Tolgee
+ */
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+}
+
+plugins {
+    id 'io.spring.dependency-management'
+    id 'org.springframework.boot'
+    id 'java'
+    id 'org.jetbrains.kotlin.jvm'
+    id "kotlin-jpa"
+    id "kotlin-allopen"
+    id "io.sentry.jvm.gradle"
+    id "org.gradle.test-retry"
+}
+
+sentry {
+    includeSourceContext = true
+    org = System.getenv("SENTRY_ORG")
+    projectName = System.getenv("SENTRY_PROJECT")
+    authToken = System.getenv("SENTRY_AUTH_TOKEN")
+    autoInstallation {
+        sentryVersion = '8.48.0'
+    }
+}
+
+group = 'io.tolgee'
+
+if (System.getenv().containsKey("VERSION")) {
+    project.version = System.getenv().get("VERSION")
+} else {
+    project.version = 'local'
+}
+
+configurations {
+    developmentOnly
+    runtimeClasspath {
+        extendsFrom developmentOnly
+    }
+    compileOnly {
+        extendsFrom annotationProcessor
+    }
+    /**
+     * OpenTelemetry Java Agent configuration.
+     * The agent is downloaded as a dependency and attached to the JVM via -javaagent flag.
+     * See: docs/observability/
+     */
+    otelAgent
+}
+
+apply plugin: 'java'
+apply plugin: 'idea'
+apply plugin: 'org.springframework.boot'
+apply plugin: 'io.spring.dependency-management'
+apply plugin: "org.jetbrains.kotlin.plugin.jpa"
+apply plugin: "kotlin-allopen"
+apply plugin: "org.jetbrains.kotlin.plugin.spring"
+apply plugin: "org.gradle.test-retry"
+
+dependencyManagement {
+    applyMavenExclusions = false
+}
+
+allOpen {
+    annotation("jakarta.persistence.Entity")
+    annotation("jakarta.persistence.MappedSuperclass")
+    annotation("jakarta.persistence.Embeddable")
+    annotation("org.springframework.stereotype.Service")
+    annotation("org.springframework.stereotype.Component")
+    annotation("org.springframework.transaction.annotation.Transactional")
+    annotation("org.springframework.beans.factory.annotation.Configurable")
+    annotation("org.springframework.boot.test.context.SpringBootTest")
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(javaVersion.toInteger())
+    }
+}
+
+kotlin {
+    compilerOptions {
+        freeCompilerArgs.addAll("-Xjsr305=strict", "-Xannotation-default-target=param-property")
+    }
+}
+
+dependencies {
+    /**
+     * SPRING
+     */
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation('org.springframework.boot:spring-boot-starter-mail') {
+        exclude group: 'org.eclipse.angus', module: 'jakarta.mail'
+    }
+    implementation libs.jakartaMail
+    implementation 'org.springframework.boot:spring-boot-starter-cache'
+    implementation("org.springframework.boot:spring-boot-starter-security")
+    implementation "org.springframework.boot:spring-boot-starter-validation"
+    implementation "org.springframework.boot:spring-boot-starter-hateoas"
+    developmentOnly 'org.springframework.boot:spring-boot-devtools'
+    implementation "org.springframework.boot:spring-boot-starter-batch-jdbc"
+    implementation "org.springframework.boot:spring-boot-starter-actuator"
+    annotationProcessor("org.springframework.boot:spring-boot-configuration-processor")
+
+    /**
+     * TESTING
+     */
+    testImplementation libs.assertJCore
+    testImplementation libs.redissonSpringCache
+    testImplementation("org.springframework.security:spring-security-test")
+    testImplementation('org.springframework.boot:spring-boot-starter-test')
+    testImplementation("io.findify:s3mock_2.13:0.2.6")
+
+    implementation libs.springmockk
+    implementation libs.jsonUnitAssert
+    testImplementation libs.mockito
+    testImplementation group: 'org.springframework.batch', name: 'spring-batch-test', version: '4.3.5'
+    testImplementation "org.springframework.boot:spring-boot-starter-websocket"
+    testImplementation(libs.azureBlob)
+    testImplementation(libs.nettyCodecHttp)
+    testImplementation(libs.nettyCodecHttp2)
+    testImplementation(libs.nettyHandler)
+    ktlint(project(":ktlint"))
+
+
+    /**
+     * MISC
+     */
+    implementation libs.commonsCodec
+    implementation libs.commonsLang
+    implementation libs.amazonS3
+    implementation libs.amazonSTS
+    implementation libs.icu4j
+    implementation libs.jacksonModuleKotlin
+    implementation libs.jacksonDataFormatXml
+    implementation 'org.apache.httpcomponents.client5:httpclient5'
+
+    implementation "org.springframework.boot:spring-boot-properties-migrator"
+
+    implementation libs.springDocOpenApiCommon
+    // Jackson-2 Kotlin module for swagger-core's schema introspection (registered on swagger's mapper
+    // in OpenApiConfiguration; schema-gen only). Keep aligned with swagger-core's jackson-databind 2.x.
+    implementation "com.fasterxml.jackson.module:jackson-module-kotlin:$jackson2Version"
+    implementation libs.redissonSpringBootStarter
+
+    /**
+     * OPENTELEMETRY
+     */
+    otelAgent libs.opentelemetryJavaagent
+    // OTEL API for context propagation in TaskDecorators
+    implementation libs.opentelemetryApi
+    implementation libs.opentelemetryContext
+
+    /**
+     * KOTLIN
+     */
+    implementation libs.kotlinReflect
+    implementation libs.kotlinCoroutines
+
+    /**
+     * Google translation API
+     */
+    implementation platform(libs.googleCloud)
+    implementation platform(libs.grpcBom)
+    implementation 'com.google.cloud:google-cloud-translate'
+
+    /**
+     * Aws translate
+     */
+    implementation libs.amazonTranslate
+
+    /**
+     * Conditional billing module
+     */
+    if (gradle.ext.billingAppDirectory.exists()) {
+        implementation(project(':billing-app'))
+    }
+
+    /**
+     * DATA MODULE
+     */
+    implementation(project(':data'))
+
+    /**
+     * TESTING MODULE
+     */
+    testImplementation(project(':testing'))
+
+    /**
+     * MISC MODULE
+     */
+    implementation(project(':misc'))
+
+    /**
+     * EE MODULE
+     */
+    if (gradle.ext.eeAppDirectoryExists) {
+        implementation(project(':ee-app'))
+    }
+
+    /**
+     * Dev module
+     */
+    implementation(project(':development'))
+
+    /**
+     * API module
+     */
+    implementation(project(':api'))
+
+
+    /**
+     * Security module
+     */
+    implementation(project(':security'))
+
+    /**
+     * MCP SDK
+     */
+    implementation platform(libs.mcpBom)
+    implementation libs.mcp
+    implementation libs.mcpSpringWebmvc
+
+}
+
+tasks.withType(Test).configureEach {
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+}
+
+tasks.named('test', Test) {
+    useJUnitPlatform()
+    maxHeapSize = "4096m"
+    testLogging {
+        events = ["passed", "failed", "skipped"]
+    }
+    rootProject.setTestRetry(it)
+}
+
+tasks.register('runContextRecreatingTests', Test) {
+    outputs.upToDateWhen { false }
+    useJUnitPlatform {
+        includeTags "contextRecreating"
+    }
+    systemProperties['spring.test.context.cache.maxSize'] = 1
+    maxHeapSize = "4096m"
+    rootProject.setTestSharding(it)
+    rootProject.setTestRetry(it)
+}
+
+tasks.register('runStandardTests', Test) {
+    outputs.upToDateWhen { false }
+    useJUnitPlatform {
+        excludeTags "contextRecreating", "websocket"
+    }
+    maxHeapSize = "4096m"
+    rootProject.setTestSharding(it)
+    rootProject.setTestRetry(it)
+}
+
+tasks.register('runWebsocketTests', Test) {
+    outputs.upToDateWhen { false }
+    useJUnitPlatform {
+        includeTags "websocket"
+    }
+    maxHeapSize = "4096m"
+    rootProject.setTestRetry(it)
+}
+
+tasks.register('runWithoutEeTests', Test) {
+    outputs.upToDateWhen { false }
+    useJUnitPlatform {
+        includeTags "withoutEe"
+    }
+    maxHeapSize = "4096m"
+    rootProject.setTestRetry(it)
+}
+
+springBoot {
+    buildInfo {
+        properties {
+            version = project.version
+        }
+    }
+}
+
+bootJar {
+    archiveFileName = "tolgee-${project.version}.jar"
+    manifest {
+        attributes('Implementation-Version': project.version)
+    }
+}
+
+sourceSets {
+    main.kotlin.srcDirs = ['src/main/kotlin', 'src/main/java']
+    test.kotlin.srcDirs = ['src/test/kotlin', 'src/test/java']
+}
+
+tasks.named('jar', Jar) {
+    duplicatesStrategy(DuplicatesStrategy.EXCLUDE)
+}
+
+tasks.named('bootJar', Jar) {
+    duplicatesStrategy(DuplicatesStrategy.EXCLUDE)
+
+    archiveFileName = "tolgee-${project.version}.jar"
+    manifest {
+        attributes('Implementation-Version': project.version)
+    }
+}
+
+normalization {
+    runtimeClasspath {
+        ignore '**/build-info.properties'
+    }
+}
+
+bootRun {
+    // OpenTelemetry Java Agent - disabled by default, enable via OTEL_JAVAAGENT_ENABLED=true
+    // See: docs/observability/
+    if (System.getenv("OTEL_JAVAAGENT_ENABLED") == "true") {
+        jvmArgs "-javaagent:${configurations.otelAgent.singleFile.absolutePath}"
+    }
+}
+
+// Copy OTEL agent JAR to a predictable location for manual IntelliJ run configuration.
+// Not used by bootRun or bootRunWithObservability (they resolve the agent from Gradle's dependency cache).
+// Usage: ./gradlew server-app:copyOtelAgent → build/otel/opentelemetry-javaagent.jar
+// Then add -javaagent:backend/app/build/otel/opentelemetry-javaagent.jar to your IntelliJ VM options.
+// See: docs/observability/
+tasks.register('copyOtelAgent', Copy) {
+    from configurations.otelAgent
+    into "${buildDir}/otel"
+    rename { 'opentelemetry-javaagent.jar' }
+}
+
+// Run with local observability stack (docker-compose.local-observability-stack-dev.yaml)
+// Drop-in replacement for bootRun: supports --args and all other BootRun options.
+// See: docs/observability/
+tasks.register('bootRunWithObservability', org.springframework.boot.gradle.tasks.run.BootRun) {
+    group = 'application'
+    description = 'Runs Tolgee with OpenTelemetry tracing, using the local Docker observability stack'
+
+    // Inherit classpath and main class from bootRun (configured by Spring Boot plugin)
+    classpath = bootRun.classpath
+    mainClass.set(bootRun.mainClass)
+
+    // OTEL configuration
+    environment 'OTEL_JAVAAGENT_ENABLED', 'true'
+    environment 'OTEL_SERVICE_NAME', 'tolgee-platform'
+    environment 'OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4318'
+    environment 'OTEL_RESOURCE_ATTRIBUTES', 'deployment.environment=local-dev'
+    environment 'OTEL_LOGS_EXPORTER', 'none'
+    environment 'OTEL_METRICS_EXPORTER', 'none'
+    environment 'OTEL_INSTRUMENTATION_LOGBACK_MDC_ENABLED', 'true'
+    environment 'OTEL_SEMCONV_STABILITY_OPT_IN', 'http'
+
+    // Database configuration (use Docker stack's PostgreSQL/Redis)
+    environment 'spring.datasource.url', 'jdbc:postgresql://localhost:5432/tolgee'
+    environment 'spring.datasource.username', 'tolgee'
+    environment 'spring.datasource.password', 'tolgee'
+    environment 'spring.redis.host', 'localhost'
+    environment 'spring.redis.port', '6379'
+    environment 'spring.redis.password', 'tolgee'
+    environment 'tolgee.postgres-autostart.enabled', 'false'
+
+    doFirst {
+        // Resolve agent JAR at execution time (not configuration time)
+        jvmArgs "-javaagent:${configurations.otelAgent.singleFile.absolutePath}"
+    }
+}
+
+// ===== Apply custom tasks, if exist, from gitignored .local directory =====
+def customTasksFile = rootProject.file('.local/gradle/backend-app.gradle')
+if (customTasksFile.exists()) {
+    logger.lifecycle("Applying custom local Gradle script: ${customTasksFile}")
+    apply from: customTasksFile
+}

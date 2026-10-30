@@ -1,0 +1,273 @@
+package io.tolgee.development.testDataBuilder.data
+
+import io.tolgee.constants.MtServiceType
+import io.tolgee.development.testDataBuilder.builders.ProjectBuilder
+import io.tolgee.development.testDataBuilder.builders.TestDataBuilder
+import io.tolgee.development.testDataBuilder.builders.UserAccountBuilder
+import io.tolgee.development.testDataBuilder.builders.slack.SlackConfigBuilder
+import io.tolgee.model.Language
+import io.tolgee.model.Organization
+import io.tolgee.model.UserAccount
+import io.tolgee.model.automations.Automation
+import io.tolgee.model.automations.AutomationAction
+import io.tolgee.model.automations.AutomationActionType
+import io.tolgee.model.automations.AutomationTrigger
+import io.tolgee.model.automations.AutomationTriggerType
+import io.tolgee.model.enums.ProjectPermissionType
+import io.tolgee.model.enums.Scope
+import io.tolgee.model.enums.TranslationState
+import io.tolgee.model.key.Key
+import io.tolgee.model.slackIntegration.OrganizationSlackWorkspace
+import io.tolgee.model.slackIntegration.SlackConfig
+import io.tolgee.model.slackIntegration.SlackEventType
+import io.tolgee.model.slackIntegration.SlackUserConnection
+import io.tolgee.model.translation.Translation
+
+class SlackTestData {
+  var user: UserAccount
+  var slackConfig: SlackConfig
+  var userAccountBuilder: UserAccountBuilder
+  var projectBuilder: ProjectBuilder
+  var organization: Organization
+  var automation: Automation
+  var key: Key
+  var key2: Key
+  lateinit var keyWithAllLanguages: Key
+  lateinit var baseTranslationNotExistKey: Key
+  lateinit var slackWorkspace: OrganizationSlackWorkspace
+  lateinit var slackWorkspace2: OrganizationSlackWorkspace
+  var secondLanguage: Language
+  lateinit var slackConfigBuilder: SlackConfigBuilder
+  lateinit var czechBeforeFrenchKey: Key
+  lateinit var czechTranslationOfCzechBeforeFrenchKey: Translation
+  lateinit var frenchTranslationOfCzechBeforeFrenchKey: Translation
+  lateinit var frenchBeforeEnglishKey: Key
+  lateinit var frenchTranslationOfFrenchBeforeEnglishKey: Translation
+  lateinit var englishTranslationOfFrenchBeforeEnglishKey: Translation
+
+  lateinit var slackUserConnection: SlackUserConnection
+  lateinit var languageOnlySlackConfig: SlackConfig
+
+  val root: TestDataBuilder =
+    TestDataBuilder().apply {
+      userAccountBuilder =
+        addUserAccount {
+          username = "admin"
+        }
+
+      userAccountBuilder.addSlackUserConnection {
+        userAccount = userAccountBuilder.self
+        slackUserId = "slackUserId"
+        slackUserConnection = this
+        slackTeamId = "slackTeamId"
+      }
+
+      projectBuilder =
+        addProject {
+          name = "test_project"
+          organizationOwner = userAccountBuilder.defaultOrganizationBuilder.self
+        }.build buildProject@{
+          this@buildProject.self.baseLanguage = this@buildProject.addEnglish().self
+
+          addAutoTranslationConfig {
+            usingTm = true
+            usingPrimaryMtService = true
+          }
+        }
+      projectBuilder
+        .addKey("testKey")
+        .also { key = it.self }
+        .addTranslation("en", "Hello")
+
+      projectBuilder
+        .addKey("testKey2")
+        .also { key2 = it.self }
+        .addTranslation("en", "Hello")
+
+      projectBuilder.addKey {
+        name = "base-translation-doesn't-exist"
+        baseTranslationNotExistKey = this
+      }
+
+      userAccountBuilder.defaultOrganizationBuilder.addSlackWorkspace {
+        author = userAccountBuilder.self
+        slackTeamId = "slackTeamId"
+        slackTeamName = "slackTeamName"
+        accessToken = "accessToken"
+        organization = userAccountBuilder.defaultOrganizationBuilder.self
+        slackWorkspace = this
+      }
+
+      userAccountBuilder.defaultOrganizationBuilder.addSlackWorkspace {
+        author = userAccountBuilder.self
+        slackTeamId = "slackTeamId2"
+        slackTeamName = "slackTeamName2"
+        accessToken = "accessToken"
+        organization = userAccountBuilder.defaultOrganizationBuilder.self
+        slackWorkspace2 = this
+      }
+
+      organization = userAccountBuilder.defaultOrganizationBuilder.self
+
+      user = userAccountBuilder.self
+
+      projectBuilder.addPermission {
+        project = projectBuilder.self
+        user = user
+        type = ProjectPermissionType.MANAGE
+        scopes = arrayOf(Scope.TRANSLATIONS_EDIT)
+      }
+
+      secondLanguage = projectBuilder.addFrench().self
+
+      projectBuilder.addCzech()
+
+      czechBeforeFrenchKey =
+        projectBuilder
+          .addKey("czechBeforeFrenchKey")
+          .build {
+            czechTranslationOfCzechBeforeFrenchKey = addTranslation("cs", "Pořadí").self
+            frenchTranslationOfCzechBeforeFrenchKey = addTranslation("fr", "Ordre").self
+          }.self
+
+      frenchBeforeEnglishKey =
+        projectBuilder
+          .addKey("frenchBeforeEnglishKey")
+          .build {
+            frenchTranslationOfFrenchBeforeEnglishKey = addTranslation("fr", "Frère").self
+            englishTranslationOfFrenchBeforeEnglishKey = addTranslation("en", "Sibling").self
+          }.self
+
+      keyWithAllLanguages =
+        projectBuilder
+          .addKey("keyWithAllLanguages")
+          .build {
+            addTranslation("en", "Dashboard")
+            addTranslation("fr", "Tableau de bord")
+            addTranslation("cs", "Nástěnka")
+          }.self
+
+      slackConfigBuilder =
+        projectBuilder
+          .addSlackConfig {
+            this.channelId = "testChannel"
+            this.project = projectBuilder.self
+            this.userAccount = userAccountBuilder.self
+            isGlobalSubscription = true
+            events = mutableSetOf(SlackEventType.ALL)
+          }.build config@{
+            addSlackMessage {
+              slackConfig = this@config.self
+              this.keyId = 0L
+              this.languageTags = mutableSetOf("en", "fr")
+            }
+
+            addSlackMessage {
+              slackConfig = this@config.self
+              this.keyId = 0L
+              this.languageTags = mutableSetOf("fr", "cz")
+            }
+
+            addSlackMessage {
+              slackConfig = this@config.self
+              this.keyId = 1L
+              this.languageTags = mutableSetOf("cz", "ru")
+            }
+
+            addSlackMessage {
+              slackConfig = this@config.self
+              this.keyId = 52L
+              this.languageTags = mutableSetOf("fr", "cz")
+            }
+          }
+      slackConfig = slackConfigBuilder.self
+
+      automation =
+        projectBuilder
+          .addAutomation {
+            this.triggers.add(
+              AutomationTrigger(this)
+                .also { it.type = AutomationTriggerType.ACTIVITY },
+            )
+            this.actions.add(
+              AutomationAction(this).also {
+                it.type = AutomationActionType.SLACK_SUBSCRIPTION
+                it.slackConfig = slackConfig
+              },
+            )
+          }.self
+    }
+
+  fun addMoreLanguages() {
+    projectBuilder.addGerman()
+    listOf("es" to "Spanish", "it" to "Italian", "pl" to "Polish").forEach { (languageTag, languageName) ->
+      projectBuilder.addLanguage {
+        tag = languageTag
+        name = languageName
+        originalName = languageName
+      }
+    }
+  }
+
+  fun subscribeToFrenchTranslationChangesOnly() {
+    slackConfig.isGlobalSubscription = false
+    slackConfigBuilder.addPreference {
+      languageTag = "fr"
+      events = mutableSetOf(SlackEventType.TRANSLATION_CHANGED)
+    }
+  }
+
+  fun addKeysInFeatureBranch(): List<Key> {
+    val keys = mutableListOf<Key>()
+    projectBuilder.addBranch { name = "feature-branch" }.build {
+      (1..6).forEach { index ->
+        projectBuilder
+          .addKey {
+            name = "branched$index"
+            branch = self
+          }.build { addTranslation("en", "Hello") }
+          .also { keys.add(it.self) }
+      }
+    }
+    return keys
+  }
+
+  fun add6KeysWithOutdatedMachineTranslations(): List<Key> =
+    (1..6).map { index ->
+      projectBuilder
+        .addKey("outdatedKey$index")
+        .build {
+          addTranslation("en", "Hello")
+          addTranslation {
+            language = secondLanguage
+            text = "Translated with Google"
+            state = TranslationState.TRANSLATED
+            auto = true
+            mtProvider = MtServiceType.GOOGLE
+            outdated = true
+          }
+        }.self
+    }
+
+  fun addLanguageOnlySlackConfigWithChannelEvents() {
+    languageOnlySlackConfig =
+      projectBuilder
+        .addSlackConfig {
+          channelId = "languageOnlyChannel"
+          project = projectBuilder.self
+          userAccount = userAccountBuilder.self
+          isGlobalSubscription = false
+          events = mutableSetOf(SlackEventType.NEW_KEY)
+        }.self
+  }
+
+  fun add10Keys(): List<Key> {
+    return (1..10).map {
+      projectBuilder
+        .addKey("key$it")
+        .build {
+          addTranslation("en", "Hello")
+        }.self
+    }
+  }
+}

@@ -1,0 +1,152 @@
+package io.tolgee.batch.data
+
+import io.tolgee.activity.data.ActivityType
+import io.tolgee.batch.ChunkProcessor
+import io.tolgee.batch.processors.AiPlaygroundChunkProcessor
+import io.tolgee.batch.processors.AssignTranslationLabelChunkProcessor
+import io.tolgee.batch.processors.AutoTranslateChunkProcessor
+import io.tolgee.batch.processors.AutoUpgradeNoticeProcessor
+import io.tolgee.batch.processors.AutoUpgradeRenewalProcessor
+import io.tolgee.batch.processors.AutomationChunkProcessor
+import io.tolgee.batch.processors.ClearTranslationsChunkProcessor
+import io.tolgee.batch.processors.CopyTranslationsChunkProcessor
+import io.tolgee.batch.processors.DeleteKeysChunkProcessor
+import io.tolgee.batch.processors.HardDeleteKeysChunkProcessor
+import io.tolgee.batch.processors.MachineTranslationChunkProcessor
+import io.tolgee.batch.processors.NoOpChunkProcessor
+import io.tolgee.batch.processors.PreTranslationByTmChunkProcessor
+import io.tolgee.batch.processors.QaCheckChunkProcessor
+import io.tolgee.batch.processors.RestoreKeysChunkProcessor
+import io.tolgee.batch.processors.SetKeysNamespaceChunkProcessor
+import io.tolgee.batch.processors.SetTranslationsStateChunkProcessor
+import io.tolgee.batch.processors.TagKeysChunkProcessor
+import io.tolgee.batch.processors.TrialExpirationNoticeProcessor
+import io.tolgee.batch.processors.UnassignTranslationLabelChunkProcessor
+import io.tolgee.batch.processors.UntagKeysChunkProcessor
+import kotlin.reflect.KClass
+
+enum class BatchJobType(
+  val activityType: ActivityType? = null,
+  /**
+   * 0 means no chunking
+   */
+  val maxRetries: Int,
+  val processor: KClass<out ChunkProcessor<*, *, *>>,
+  val defaultRetryWaitTimeInMs: Int = 2000,
+  /**
+   * Default value for whether this job type should be exclusive for a project
+   * (only one job can run at a time for a project).
+   *
+   * Can be overridden via `tolgee.batch.job-type-overrides.<TYPE>.exclusive`.
+   * Use [io.tolgee.configuration.tolgee.BatchProperties.isExclusive] to get the effective value.
+   */
+  val defaultExclusive: Boolean = true,
+) {
+  AI_PLAYGROUND_TRANSLATE(
+    maxRetries = 3,
+    processor = AiPlaygroundChunkProcessor::class,
+  ),
+  PRE_TRANSLATE_BT_TM(
+    activityType = ActivityType.BATCH_PRE_TRANSLATE_BY_TM,
+    maxRetries = 3,
+    processor = PreTranslationByTmChunkProcessor::class,
+  ),
+  MACHINE_TRANSLATE(
+    activityType = ActivityType.BATCH_MACHINE_TRANSLATE,
+    maxRetries = 3,
+    processor = MachineTranslationChunkProcessor::class,
+  ),
+  AUTO_TRANSLATE(
+    activityType = ActivityType.AUTO_TRANSLATE,
+    maxRetries = 3,
+    processor = AutoTranslateChunkProcessor::class,
+    defaultExclusive = false,
+  ),
+  DELETE_KEYS(
+    activityType = ActivityType.KEY_SOFT_DELETE,
+    maxRetries = 3,
+    processor = DeleteKeysChunkProcessor::class,
+  ),
+  RESTORE_KEYS(
+    activityType = ActivityType.BATCH_KEY_RESTORE,
+    maxRetries = 3,
+    processor = RestoreKeysChunkProcessor::class,
+  ),
+  HARD_DELETE_KEYS(
+    activityType = ActivityType.BATCH_KEY_HARD_DELETE,
+    maxRetries = 3,
+    processor = HardDeleteKeysChunkProcessor::class,
+  ),
+  SET_TRANSLATIONS_STATE(
+    activityType = ActivityType.BATCH_SET_TRANSLATION_STATE,
+    maxRetries = 3,
+    processor = SetTranslationsStateChunkProcessor::class,
+  ),
+  CLEAR_TRANSLATIONS(
+    activityType = ActivityType.BATCH_CLEAR_TRANSLATIONS,
+    maxRetries = 3,
+    processor = ClearTranslationsChunkProcessor::class,
+  ),
+  COPY_TRANSLATIONS(
+    activityType = ActivityType.BATCH_COPY_TRANSLATIONS,
+    maxRetries = 3,
+    processor = CopyTranslationsChunkProcessor::class,
+  ),
+  TAG_KEYS(
+    activityType = ActivityType.BATCH_TAG_KEYS,
+    maxRetries = 3,
+    processor = TagKeysChunkProcessor::class,
+  ),
+  UNTAG_KEYS(
+    activityType = ActivityType.BATCH_UNTAG_KEYS,
+    maxRetries = 3,
+    processor = UntagKeysChunkProcessor::class,
+  ),
+  SET_KEYS_NAMESPACE(
+    activityType = ActivityType.BATCH_SET_KEYS_NAMESPACE,
+    maxRetries = 3,
+    processor = SetKeysNamespaceChunkProcessor::class,
+  ),
+  AUTOMATION(
+    activityType = ActivityType.AUTOMATION,
+    maxRetries = 3,
+    processor = AutomationChunkProcessor::class,
+    defaultExclusive = false,
+  ),
+  BILLING_TRIAL_EXPIRATION_NOTICE(
+    maxRetries = 3,
+    processor = TrialExpirationNoticeProcessor::class,
+  ),
+  BILLING_AUTO_UPGRADE_NOTICE(
+    maxRetries = 3,
+    processor = AutoUpgradeNoticeProcessor::class,
+  ),
+  BILLING_AUTO_UPGRADE_RENEWAL(
+    maxRetries = 3,
+    // Stripe rejects subscription modifications while the customer has another operation in
+    // flight; the default 2s burns all three retries before it clears.
+    defaultRetryWaitTimeInMs = 30_000,
+    processor = AutoUpgradeRenewalProcessor::class,
+  ),
+  ASSIGN_TRANSLATION_LABEL(
+    activityType = ActivityType.BATCH_ASSIGN_TRANSLATION_LABEL,
+    maxRetries = 3,
+    processor = AssignTranslationLabelChunkProcessor::class,
+  ),
+  UNASSIGN_TRANSLATION_LABEL(
+    activityType = ActivityType.BATCH_UNASSIGN_TRANSLATION_LABEL,
+    maxRetries = 3,
+    processor = UnassignTranslationLabelChunkProcessor::class,
+  ),
+  QA_CHECK(
+    maxRetries = 3,
+    processor = QaCheckChunkProcessor::class,
+    defaultExclusive = false,
+  ),
+  NO_OP(
+    activityType = null,
+    maxRetries = 0,
+    processor = NoOpChunkProcessor::class,
+    defaultExclusive = false,
+  ),
+}

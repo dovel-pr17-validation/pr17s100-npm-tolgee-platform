@@ -1,0 +1,129 @@
+package io.tolgee.ee.repository
+
+import io.tolgee.dtos.request.suggestion.SuggestionFilters
+import io.tolgee.model.TranslationSuggestion
+import io.tolgee.model.views.TranslationSuggestionView
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.Pageable
+import org.springframework.data.jpa.repository.JpaRepository
+import org.springframework.data.jpa.repository.Query
+import org.springframework.stereotype.Repository
+
+@Repository
+interface TranslationSuggestionRepository : JpaRepository<TranslationSuggestion, Long> {
+  @Query(
+    """
+      select id, keyId, languageId, languageTag, translation, state, plural,
+             authorId, authorName, authorUsername, authorAvatarHash, authorDeletedAt
+      from (
+        select
+          ts.id as id,
+          ts.key_id as keyId,
+          ts.language_id as languageId,
+          l.tag as languageTag,
+          ts.translation as translation,
+          ts.state as state,
+          ts.is_plural as plural,
+          u.id as authorId,
+          u.name as authorName,
+          u.username as authorUsername,
+          u.avatar_hash as authorAvatarHash,
+          u.deleted_at as authorDeletedAt,
+          row_number() over (
+            partition by ts.language_id, ts.key_id
+            order by ts.created_at desc, ts.id desc
+          ) as rn
+        from translation_suggestion ts
+          left join language l on l.id = ts.language_id
+          left join user_account u on u.id = ts.author_id
+        where ts.key_id in :keyIds
+          and ts.project_id = :projectId
+          and ts.language_id in :languageIds
+          and ts.state = 'ACTIVE'
+      ) sub
+      where sub.rn <= :maxPerKey
+      order by sub.languageId, sub.keyId, sub.rn
+    """,
+    nativeQuery = true,
+  )
+  fun getByKeyId(
+    projectId: Long,
+    languageIds: List<Long>,
+    keyIds: List<Long>,
+    maxPerKey: Int,
+  ): List<TranslationSuggestionView>
+
+  @Query(
+    """
+      from TranslationSuggestion ts
+        left join fetch ts.language
+        left join fetch ts.author
+      where ts.project.id = :projectId
+        and ts.key.id = :keyId
+        and ts.language.id = :languageId
+        and (
+            :#{#filters.filterState} is null
+            or ts.state in :#{#filters.filterState}
+        )
+    """,
+  )
+  fun getPaged(
+    pageable: Pageable,
+    projectId: Long,
+    languageId: Long,
+    keyId: Long,
+    filters: SuggestionFilters,
+  ): Page<TranslationSuggestion>
+
+  @Query(
+    """
+        from TranslationSuggestion ts
+        where ts.id = :suggestionId
+            and ts.project.id = :projectId
+            and ts.language.id = :languageId
+            and ts.key.id = :keyId
+    """,
+  )
+  fun find(
+    projectId: Long,
+    languageId: Long,
+    keyId: Long,
+    suggestionId: Long,
+  ): TranslationSuggestion?
+
+  @Query(
+    """
+        from TranslationSuggestion ts
+        where ts.project.id = :projectId
+            and ts.language.id = :languageId
+            and ts.key.id = :keyId
+            and ts.state = 'ACTIVE'
+    """,
+  )
+  fun getAllActive(
+    projectId: Long,
+    languageId: Long,
+    keyId: Long,
+  ): List<TranslationSuggestion>
+
+  @Query(
+    """
+        select ts from TranslationSuggestion ts
+            join ts.language
+            join ts.key
+        where ts.project.id = :projectId
+            and ts.language.id = :languageId
+            and ts.key.id = :keyId
+            and ts.translation = :translation
+            and ts.isPlural = :isPlural
+            and ts.state = 'ACTIVE'
+    """,
+  )
+  fun findSuggestion(
+    projectId: Long,
+    languageId: Long,
+    keyId: Long,
+    translation: String,
+    isPlural: Boolean,
+  ): List<TranslationSuggestion>
+}

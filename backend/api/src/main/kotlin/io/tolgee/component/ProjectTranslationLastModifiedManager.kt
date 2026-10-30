@@ -1,0 +1,51 @@
+package io.tolgee.component
+
+import io.tolgee.constants.Caches
+import io.tolgee.events.OnProjectActivityEvent
+import org.springframework.cache.Cache
+import org.springframework.cache.CacheManager
+import org.springframework.context.event.EventListener
+import org.springframework.stereotype.Component
+import java.util.UUID
+
+@Component
+class ProjectTranslationLastModifiedManager(
+  val currentDateProvider: CurrentDateProvider,
+  val cacheManager: CacheManager,
+  private val resilientCacheAccessor: ResilientCacheAccessor,
+) {
+  /**
+   * Returns the last modification information for a given project.
+   * If no information exists in the cache, creates new modification info with the current timestamp and UUID,
+   * stores it in the cache and returns it.
+   *
+   * @param projectId The ID of the project to get last modified info for
+   * @return LastModifiedInfo containing timestamp and ETag for the project
+   */
+  fun getLastModifiedInfo(projectId: Long): LastModifiedInfo {
+    val cache = getCache()
+    return cache?.let { resilientCacheAccessor.get(it, projectId, LastModifiedInfo::class.java) }
+      ?: getCurrentInfo().also { cache?.put(projectId, it) }
+  }
+
+  private fun getCache(): Cache? = cacheManager.getCache(Caches.PROJECT_TRANSLATIONS_MODIFIED)
+
+  @EventListener
+  fun onActivity(event: OnProjectActivityEvent) {
+    event.activityRevision.projectId?.let { projectId ->
+      getCache()?.put(projectId, getCurrentInfo())
+    }
+  }
+
+  private fun getCurrentInfo(): LastModifiedInfo {
+    return LastModifiedInfo(
+      lastModified = currentDateProvider.date.time,
+      eTag = UUID.randomUUID().toString(),
+    )
+  }
+
+  data class LastModifiedInfo(
+    val lastModified: Long,
+    val eTag: String,
+  )
+}

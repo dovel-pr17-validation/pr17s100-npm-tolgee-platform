@@ -1,0 +1,769 @@
+name: Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, release]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  backend-build:
+    name: Build backend 🏗️
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+
+      # Don't build test classes here; they'll only be used once during the test run anyway.
+      # This amortizes the cost of compilation across each test job, rather than paying it upfront.
+      # Test emails are built nonetheless, as they may be used by multiple subprojects...
+      #
+      # Note: seems like running in parallel has the weird side effect of causing Spring dependency management to hang
+      # It's very occasional, and doesn't seem to occur locally, but parallel being the issue is possible
+      # See: https://github.com/spring-gradle-plugins/dependency-management-plugin/issues/370
+      - name: Build backend
+        run: ./gradlew classes jar bootJar buildTestEmails
+
+      - name: Upload backend build result
+        uses: ./.github/actions/upload-backend-build
+
+  backend-build-without-ee:
+    name: Build backend without ee 🏗️
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          node: "false"
+
+      - name: Remove ee
+        run: rm -rf ./ee
+
+      - name: Build backend without ee
+        run: ./gradlew classes jar bootJar
+
+  backend-test:
+    name: BT ‍🔎 (${{ matrix.command }}${{ matrix.shard_total != '' && format(' shard {0}/{1}', matrix.shard_index, matrix.shard_total) || '' }})
+    needs: [backend-build]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        command:
+          [
+            "server-app:runContextRecreatingTests",
+            "server-app:runStandardTests",
+            "server-app:runWebsocketTests",
+            "server-app:runWithoutEeTests",
+            "ee-test:test",
+            "data:test",
+            "security:test",
+            "ktlint:test",
+          ]
+        shard_index: [""]
+        shard_total: [""]
+        include:
+          - command: "server-app:runStandardTests"
+            shard_index: "0"
+            shard_total: "4"
+          - command: "server-app:runStandardTests"
+            shard_index: "1"
+            shard_total: "4"
+          - command: "server-app:runStandardTests"
+            shard_index: "2"
+            shard_total: "4"
+          - command: "server-app:runStandardTests"
+            shard_index: "3"
+            shard_total: "4"
+          - command: "server-app:runContextRecreatingTests"
+            shard_index: "0"
+            shard_total: "2"
+          - command: "server-app:runContextRecreatingTests"
+            shard_index: "1"
+            shard_total: "2"
+          - command: "ee-test:test"
+            shard_index: "0"
+            shard_total: "3"
+          - command: "ee-test:test"
+            shard_index: "1"
+            shard_total: "3"
+          - command: "ee-test:test"
+            shard_index: "2"
+            shard_total: "3"
+        exclude:
+          - command: "server-app:runStandardTests"
+            shard_index: ""
+            shard_total: ""
+          - command: "server-app:runContextRecreatingTests"
+            shard_index: ""
+            shard_total: ""
+          - command: "ee-test:test"
+            shard_index: ""
+            shard_total: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          node: "false"
+
+      - name: Download backend build result
+        uses: ./.github/actions/download-backend-build
+
+      - name: Remove ee
+        if: matrix.command == 'server-app:runWithoutEeTests'
+        run: |
+          rm -rf ./ee
+
+      - name: Run backend tests
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 30
+          max_attempts: ${{ github.event_name == 'push' && 5 || 1 }}
+          # Print free memory for debugging purposes
+          command: ./gradlew ${{ matrix.command }}
+        env:
+          SKIP_SERVER_BUILD: true
+          SKIP_EMAIL_BUILD: true
+          CI_RELEASE: ${{ github.event_name == 'push' && true || false }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_TOTAL: ${{ matrix.shard_total }}
+
+      - name: Get report name
+        id: reportName
+        if: always()
+        run: |
+          reportName=${{ matrix.command }}
+          suffix=${{ matrix.shard_total != '' && format('_shard{0}', matrix.shard_index) || '' }}
+          echo "reportName=${reportName//\:/_}${suffix}" >> $GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend_test_reports_${{ steps.reportName.outputs.reportName }}
+          path: |
+            ./**/build/reports/**/*
+
+      - name: Test Report
+        uses: dorny/test-reporter@v1
+        if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        with:
+          name: Test report for ${{ matrix.command }}${{ matrix.shard_total != '' && format(' shard {0}/{1}', matrix.shard_index, matrix.shard_total) || '' }}
+          path: "**/build/test-results/**/TEST-*.xml"
+          fail-on-error: false
+          reporter: java-junit
+
+      - name: Setup Node
+        if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Convert JUnit to CTRF
+        if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        continue-on-error: true
+        run: npx --yes junit-to-ctrf "**/build/test-results/**/TEST-*.xml" --output "ctrf/ctrf-report.json"
+
+      - name: Flaky tests report (CTRF)
+        if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: ctrf-io/github-test-reporter@v1
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          title: CTRF Test report for ${{ matrix.command }}${{ matrix.shard_total != '' && format(' shard {0}/{1}', matrix.shard_index, matrix.shard_total) || '' }}
+          report-path: |
+            ctrf/ctrf-report.json
+          github-report: true
+          flaky-report: true
+          flaky-rate-report: true
+
+  e2e:
+    needs: [frontend-build, backend-build, e2e-install-deps]
+    runs-on: ubuntu-24.04
+    name: E2E testing ‍🔎
+    strategy:
+      fail-fast: false
+      matrix:
+        total_jobs: [20]
+        job_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+
+      - name: Download backend build result
+        uses: ./.github/actions/download-backend-build
+
+      - name: Download frontend build result
+        uses: actions/download-artifact@v4
+        with:
+          name: webapp
+          path: ./webapp/dist
+
+      - name: Download dependencies
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e_deps
+          path: ~/
+
+      - name: Untar node modules
+        run: |
+          tar --zstd -xf ~/node_modules.tar.zst ./e2e/node_modules
+
+      - name: Create cache directory
+        run: |
+          mkdir -p ~/.cache
+
+      - name: Untar Cypress cache
+        run: |
+          tar --zstd -xf ~/cypress_cache.tar.zst
+        working-directory: /home/runner/.cache/
+
+      - name: Run e2e test
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 30
+          max_attempts: ${{ github.event_name == 'push' && 5 || 1 }}
+          command: |
+            ./gradlew runE2e -x bootJar -x buildWebapp
+        env:
+          TOLGEE_API_KEY: ${{secrets.TOLGEE_API_KEY}}
+          TOLGEE_API_URL: ${{secrets.TOLGEE_API_URL}}
+          SKIP_WEBAPP_BUILD: true
+          SKIP_SERVER_BUILD: true
+          SKIP_EMAIL_BUILD: true
+          SKIP_INSTALL_E2E_DEPS: true
+          E2E_TOTAL_JOBS: ${{matrix.total_jobs}}
+          E2E_JOB_INDEX: ${{matrix.job_index}}
+          CI_RELEASE: ${{ github.event_name == 'push' && true || false }}
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e_${{ matrix.job_index }}
+          path: |
+            ./e2e/cypress/videos/**/*
+            ./e2e/cypress/screenshots/**/*
+            ./e2e/server
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e_server_log_${{ matrix.job_index }}
+          path: |
+            ./e2e/server.log
+
+  frontend-build:
+    name: Build frontend 🏗️
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+
+      - name: Build webapp
+        run: ./gradlew buildWebapp
+        env:
+          TOLGEE_API_KEY: ${{secrets.TOLGEE_API_KEY}}
+          TOLGEE_API_URL: ${{secrets.TOLGEE_API_URL}}
+
+      - name: Upload built webapp
+        uses: actions/upload-artifact@v4
+        with:
+          name: webapp
+          path: webapp/dist
+
+  frontend-code-check:
+    name: Frontend static check 🪲
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          java: "false"
+
+      - name: Install library dependencies
+        run: npm ci
+        working-directory: ./library
+
+      - name: Lint library
+        run: npm run lint
+        working-directory: ./library
+
+      - name: Install webapp dependencies
+        run: npm ci
+        working-directory: ./webapp
+
+      - name: Typescript on webapp
+        run: npm run tsc
+        working-directory: ./webapp
+
+      - name: Eslint on webapp
+        run: npm run eslint
+        working-directory: ./webapp
+
+      - name: Keys extraction check
+        run: npm run check-translations
+        working-directory: ./webapp
+
+      - name: Load newest translations
+        run: npm run load-translations
+        working-directory: ./webapp
+        if: ${{ env.TOLGEE_API_KEY != '' }}
+        env:
+          TOLGEE_API_KEY: ${{secrets.TOLGEE_API_KEY}}
+
+      - name: Verify translation-key type-check is active
+        run: npm run tsc:prod:selftest
+        working-directory: ./webapp
+
+      - name: Check missing translation keys
+        run: npm run tsc:prod
+        working-directory: ./webapp
+        if: ${{ env.TOLGEE_API_KEY != '' }}
+        env:
+          TOLGEE_API_KEY: ${{secrets.TOLGEE_API_KEY}}
+
+      - name: Check it builds without ee directory
+        run: |
+          rm -rf ./src/ee
+          npm --prefix ../library install
+          npm install
+          npm run tsc
+          npm run build
+        working-directory: ./webapp
+
+  frontend-test:
+    name: Frontend unit tests 🧪
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          java: "false"
+
+      - name: Install library dependencies
+        run: npm ci
+        working-directory: ./library
+
+      - name: Install webapp dependencies
+        run: npm ci
+        working-directory: ./webapp
+
+      - name: Run webapp unit tests
+        run: npm test
+        working-directory: ./webapp
+
+  frontend-test-without-ee:
+    name: Frontend unit tests without ee 🧪
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          java: "false"
+
+      - name: Install library dependencies
+        run: npm ci
+        working-directory: ./library
+
+      # Remove ee before installing webapp deps so the prepare hook (prepareEe.js)
+      # links the OSS stub instead of the ee module.
+      - name: Remove ee
+        run: rm -rf ./src/ee
+        working-directory: ./webapp
+
+      - name: Install webapp dependencies
+        run: npm ci
+        working-directory: ./webapp
+
+      - name: Run webapp unit tests
+        run: npm test
+        working-directory: ./webapp
+
+  schema-check:
+    name: Schema Check 📋
+    needs: [backend-build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+
+      - name: Download backend build result
+        uses: ./.github/actions/download-backend-build
+
+      - name: Install webapp dependencies
+        run: npm ci
+        working-directory: ./webapp
+
+      - name: Start backend
+        run: |
+          ./gradlew server-app:bootRun --args='--spring.profiles.active=dev' &
+          echo "Waiting for backend to start..."
+          timeout 180 bash -c 'until curl -s http://localhost:8080/actuator/health > /dev/null 2>&1; do sleep 2; done'
+          echo "Backend is ready"
+        env:
+          SKIP_SERVER_BUILD: true
+          SKIP_EMAIL_BUILD: true
+
+      - name: Generate schema
+        run: npm run schema
+        working-directory: ./webapp
+        env:
+          VITE_APP_API_URL: http://localhost:8080
+
+      - name: Check for uncommitted schema changes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "❌ Schema files have changed! Please run 'npm run schema' locally and commit the changes."
+            echo ""
+            echo "Changed files:"
+            git status --porcelain
+            echo ""
+            echo "Diff:"
+            git diff
+            exit 1
+          fi
+          echo "✅ Schema files are up to date"
+
+  migration-check:
+    name: Migration Check 🗃️
+    needs: [backend-build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          node: "false"
+
+      - name: Download backend build result
+        uses: ./.github/actions/download-backend-build
+
+      - name: Generate migration diff
+        run: ./gradlew diffChangeLog
+        env:
+          SKIP_SERVER_BUILD: true
+
+      - name: Check for uncommitted migration changes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "❌ Migration files are out of date! Please run './gradlew diffChangeLog' locally and commit the changes."
+            echo ""
+            echo "Changed files:"
+            git status --porcelain
+            echo ""
+            echo "Diff:"
+            git diff
+            exit 1
+          fi
+          echo "✅ Migration files are up to date"
+
+  data-cy-check:
+    name: DataCy Check 🏷️
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          java: "false"
+          npm-cache: "false"
+
+      - name: Generate dataCy types
+        run: node ./scripts/generate-data-cy.mjs
+        working-directory: ./webapp
+
+      - name: Check for uncommitted dataCy changes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "❌ dataCyType.d.ts is out of date! Please run 'npm run generate-data-cy' in webapp/ and commit the changes."
+            echo ""
+            echo "Changed files:"
+            git status --porcelain
+            echo ""
+            echo "Diff:"
+            git diff
+            exit 1
+          fi
+          echo "✅ dataCyType.d.ts is up to date"
+
+  e2e-code-checks:
+    name: E2E Static Check 🪲
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          java: "false"
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ./e2e
+
+      - name: Eslint
+        run: npm run eslint
+        working-directory: ./e2e
+
+      - name: Typecheck
+        run: npm run tsc
+        working-directory: ./e2e
+
+  e2e-install-deps:
+    name: Install E2E dependencies ⬇️
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          java: "false"
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ./e2e
+
+      - name: Tar node modules
+        run: |
+          tar --zstd -cf ~/node_modules.tar.zst ./e2e/node_modules
+
+      - name: Tar Cypress cache
+        run: |
+          tar --zstd -cf ~/cypress_cache.tar.zst ./Cypress
+        working-directory: /home/runner/.cache/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e_deps
+          path: |
+            ~/node_modules.tar.zst
+            ~/cypress_cache.tar.zst
+
+  backend-code-checks:
+    name: Ktlint 🪲
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          node: "false"
+
+      - name: Run ktlint
+        run: ./gradlew ktlintCheck
+
+  email-code-checks:
+    name: Email templates static check 🪲
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          java: 'false'
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ./email
+
+      - name: TypeScript
+        run: npm run tsc
+        working-directory: ./email
+
+      - name: ESLint
+        run: npm run eslint
+        working-directory: ./email
+
+  docker-slim-smoke:
+    name: Slim Docker smoke 🐳
+    needs: [backend-build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          node: "false"
+
+      - name: Download backend build result
+        uses: ./.github/actions/download-backend-build
+
+      - name: Build slim Docker image
+        run: ./gradlew dockerSlim
+        env:
+          SKIP_SERVER_BUILD: true
+
+      - name: Start slim image
+        run: |
+          docker run -d --name tolgee-slim --network host \
+            -e SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/postgres \
+            -e SPRING_DATASOURCE_USERNAME=postgres \
+            -e SPRING_DATASOURCE_PASSWORD=postgres \
+            tolgee/tolgee:slim
+
+      - name: Wait for app to report healthy
+        run: |
+          for i in $(seq 1 90); do
+            status=$(curl -fsS http://localhost:8080/actuator/health 2>/dev/null \
+              | jq -r '.status // empty')
+            if [ "$status" = "UP" ]; then
+              echo "Slim image healthy after $((i * 2))s"
+              exit 0
+            fi
+            echo "[$i] status=${status:-<unreachable>}; retrying in 2s"
+            sleep 2
+          done
+          echo "❌ Slim image did not report UP within 180s"
+          exit 1
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker logs tolgee-slim || true
+
+  everything-passed:
+    name: Everything passed 🎉
+    needs:
+      - backend-build
+      - backend-build-without-ee
+      - backend-test
+      - backend-code-checks
+      - email-code-checks
+      - frontend-build
+      - frontend-code-check
+      - frontend-test
+      - frontend-test-without-ee
+      - schema-check
+      - migration-check
+      - data-cy-check
+      - docker-slim-smoke
+      - e2e
+      - e2e-code-checks
+      - e2e-install-deps
+    runs-on: ubuntu-24.04
+    if: always()
+    steps:
+      - run: |
+          # Check the results of all jobs
+          failed_jobs=()
+
+          if [[ "${{ needs.backend-build.result }}" != "success" ]]; then
+            failed_jobs+=("backend-build")
+          fi
+
+          if [[ "${{ needs.backend-build-without-ee.result }}" != "success" ]]; then
+            failed_jobs+=("backend-build-without-ee")
+          fi
+
+          if [[ "${{ needs.backend-test.result }}" != "success" ]]; then
+            failed_jobs+=("backend-test")
+          fi
+
+          if [[ "${{ needs.backend-code-checks.result }}" != "success" ]]; then
+            failed_jobs+=("backend-code-checks")
+          fi
+
+          if [[ "${{ needs.frontend-build.result }}" != "success" ]]; then
+            failed_jobs+=("frontend-build")
+          fi
+
+          if [[ "${{ needs.frontend-code-check.result }}" != "success" ]]; then
+            failed_jobs+=("frontend-code-check")
+          fi
+
+          if [[ "${{ needs.frontend-test.result }}" != "success" ]]; then
+            failed_jobs+=("frontend-test")
+          fi
+
+          if [[ "${{ needs.frontend-test-without-ee.result }}" != "success" ]]; then
+            failed_jobs+=("frontend-test-without-ee")
+          fi
+
+          if [[ "${{ needs.schema-check.result }}" != "success" ]]; then
+            failed_jobs+=("schema-check")
+          fi
+
+          if [[ "${{ needs.migration-check.result }}" != "success" ]]; then
+            failed_jobs+=("migration-check")
+          fi
+
+          if [[ "${{ needs.data-cy-check.result }}" != "success" ]]; then
+            failed_jobs+=("data-cy-check")
+          fi
+
+          if [[ "${{ needs.docker-slim-smoke.result }}" != "success" ]]; then
+            failed_jobs+=("docker-slim-smoke")
+          fi
+
+          if [[ "${{ needs.e2e.result }}" != "success" ]]; then
+            failed_jobs+=("e2e")
+          fi
+
+          if [[ "${{ needs.e2e-code-checks.result }}" != "success" ]]; then
+            failed_jobs+=("e2e-code-checks")
+          fi
+
+          if [[ "${{ needs.e2e-install-deps.result }}" != "success" ]]; then
+            failed_jobs+=("e2e-install-deps")
+          fi
+
+          if [[ "${{ needs.email-code-checks.result }}" != "success" ]]; then
+            failed_jobs+=("email-code-checks")
+          fi
+
+          if [[ "${#failed_jobs[@]}" -gt 0 ]]; then
+            echo "The following jobs failed: ${failed_jobs[*]}"
+            exit 1
+          fi
+
+          echo "Everything passed 🎉"

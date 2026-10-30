@@ -1,0 +1,372 @@
+package io.tolgee.ee.service
+
+import io.tolgee.component.CurrentDateProvider
+import io.tolgee.component.ResilientCacheAccessor
+import io.tolgee.component.adminMtServiceFilter.AdminMtServiceFilter
+import io.tolgee.configuration.tolgee.InternalProperties
+import io.tolgee.configuration.tolgee.machineTranslation.LlmProviderInterface
+import io.tolgee.constants.Caches
+import io.tolgee.constants.Message
+import io.tolgee.dtos.LlmParams
+import io.tolgee.dtos.LlmProviderDto
+import io.tolgee.dtos.PromptResult
+import io.tolgee.dtos.request.llmProvider.LlmProviderRequest
+import io.tolgee.ee.component.llm.AbstractLlmApiService
+import io.tolgee.ee.component.llm.AnthropicApiService
+import io.tolgee.ee.component.llm.GoogleAiApiService
+import io.tolgee.ee.component.llm.OpenaiApiService
+import io.tolgee.ee.component.llm.TolgeeApiService
+import io.tolgee.exceptions.FailedDependencyException
+import io.tolgee.exceptions.InvalidStateException
+import io.tolgee.exceptions.LlmProviderNotFoundException
+import io.tolgee.exceptions.LlmRateLimitedException
+import io.tolgee.exceptions.NotFoundException
+import io.tolgee.model.LlmProvider
+import io.tolgee.model.enums.LlmProviderPriority
+import io.tolgee.model.enums.LlmProviderType
+import io.tolgee.repository.LlmProviderRepository
+import io.tolgee.service.LlmPropertiesService
+import io.tolgee.service.organization.OrganizationService
+import io.tolgee.util.SsrfSafeRequestFactoryProvider
+import io.tolgee.util.UrlSecurity
+import org.springframework.boot.restclient.RestTemplateBuilder
+import org.springframework.cache.Cache
+import org.springframework.cache.CacheManager
+import org.springframework.cache.set
+import org.springframework.http.HttpStatus
+import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Transactional
+import org.springframework.web.client.HttpClientErrorException
+import org.springframework.web.client.ResourceAccessException
+import org.springframework.web.client.RestTemplate
+import java.time.Duration
+import kotlin.math.roundToInt
+
+@Service
+class LlmProviderService(
+  private val llmProviderRepository: LlmProviderRepository,
+  private val organizationService: OrganizationService,
+  private val llmPropertiesService: LlmPropertiesService,
+  private val openaiApiService: OpenaiApiService,
+  private val tolgeeApiService: TolgeeApiService,
+  private val cacheManager: CacheManager,
+  private val currentDateProvider: CurrentDateProvider,
+  private val restTemplateBuilder: RestTemplateBuilder,
+  private val internalProperties: InternalProperties,
+  private val anthropicApiService: AnthropicApiService,
+  private val googleAiApiService: GoogleAiApiService,
+  private val llmProviderResolver: LlmProviderResolver,
+  private val urlSecurity: UrlSecurity,
+  private val ssrfSafeRequestFactoryProvider: SsrfSafeRequestFactoryProvider,
+  private val adminMtServiceFilter: AdminMtServiceFilter,
+  private val resilientCacheAccessor: ResilientCacheAccessor,
+) {
+  private val cache: Cache by lazy { cacheManager.getCache(Caches.LLM_PROVIDERS) ?: throw InvalidStateException() }
+  private var lastUsedMap: MutableMap<String, Long> = mutableMapOf()
+
+  fun callProvider(
+    organizationId: Long,
+    provider: String,
+    params: LlmParams,
+    attempts: List<Int>? = null,
+  ): PromptResult {
+    val resolvedProvider = llmProviderResolver.resolveProviderName(organizationId, provider)
+    return callProviderInternal(organizationId, resolvedProvider, params, attempts)
+  }
+
+  private fun callProviderInternal(
+    organizationId: Long,
+    provider: String,
+    params: LlmParams,
+    attempts: List<Int>? = null,
+  ): PromptResult {
+    val result =
+      repeatWhileProvidersRateLimited(organizationId, provider, params.priority) { providerConfig ->
+        val providerService = getProviderService(providerConfig.type)
+        val resolvedAttempts = attempts ?: providerConfig.attempts ?: providerService.defaultAttempts()
+        repeatWithTimeouts(resolvedAttempts, providerConfig) { restTemplate ->
+          val result = getProviderResponse(providerService, params, providerConfig, restTemplate)
+          result.price = if (result.price != 0) result.price else calculatePrice(providerConfig, result.usage)
+          result
+        }
+      }
+    return result
+  }
+
+  fun createProvider(
+    organizationId: Long,
+    dto: LlmProviderRequest,
+  ): LlmProviderDto {
+    validateApiUrl(dto.apiUrl)
+    val provider =
+      LlmProvider(
+        name = dto.name,
+        type = dto.type,
+        priority = dto.priority,
+        apiKey = dto.apiKey,
+        apiUrl = dto.apiUrl,
+        model = dto.model,
+        deployment = dto.deployment,
+        keepAlive = dto.keepAlive,
+        format = dto.format,
+        reasoningEffort = dto.reasoningEffort,
+        organization = organizationService.get(organizationId),
+      )
+    llmProviderRepository.save(provider)
+    return provider.toDto()
+  }
+
+  @Transactional
+  fun updateProvider(
+    organizationId: Long,
+    providerId: Long,
+    dto: LlmProviderRequest,
+  ): LlmProviderDto {
+    val provider =
+      llmProviderRepository.findByIdAndOrganizationId(providerId, organizationId) ?: throw NotFoundException()
+    validateApiUrl(dto.apiUrl)
+    provider.name = dto.name
+    provider.type = dto.type
+    provider.priority = dto.priority
+    provider.apiKey = dto.apiKey
+    provider.apiUrl = dto.apiUrl
+    provider.model = dto.model
+    provider.deployment = dto.deployment
+    provider.keepAlive = dto.keepAlive
+    provider.format = dto.format
+    provider.reasoningEffort = dto.reasoningEffort
+    llmProviderRepository.save(provider)
+    return provider.toDto()
+  }
+
+  @Transactional
+  fun deleteProvider(
+    organizationId: Long,
+    providerId: Long,
+  ) {
+    llmProviderRepository.deleteByIdAndOrganizationId(providerId, organizationId)
+  }
+
+  fun getAll(organizationId: Long): List<LlmProviderDto> {
+    return llmProviderRepository.getAll(organizationId).map { it.toDto() }
+  }
+
+  fun getAllServerProviders(): List<LlmProviderDto> {
+    return llmPropertiesService.getProviders().mapIndexed { index, llmProvider ->
+      llmProvider.toDto(-(index.toLong()) - 1)
+    }
+  }
+
+  fun <T> repeatWhileProvidersRateLimited(
+    organizationId: Long,
+    provider: String,
+    priority: LlmProviderPriority?,
+    callback: (provider: LlmProviderDto) -> T,
+  ): T {
+    var lastError: Exception? = null
+    var retryAt: Long? = null
+
+    repeat(3) {
+      val providerConfig = getProviderByName(organizationId, provider, priority)
+      try {
+        return callback(providerConfig)
+      } catch (e: LlmRateLimitedException) {
+        retryAt = e.retryAt
+        lastError = e
+      } catch (e: HttpClientErrorException) {
+        if (e.statusCode == HttpStatus.TOO_MANY_REQUESTS) {
+          suspendProvider(provider, providerConfig.id)
+          lastError = e
+        } else {
+          throw e
+        }
+      }
+    }
+    throw LlmRateLimitedException(
+      retryAt = retryAt ?: (currentDateProvider.date.time + RATE_LIMIT_SUSPEND_PERIOD_MS),
+      params = lastError?.message?.let { listOf(it) },
+      cause = lastError,
+    )
+  }
+
+  fun <T> repeatWithTimeouts(
+    attempts: List<Int>,
+    provider: LlmProviderDto,
+    callback: (restTemplate: RestTemplate) -> T,
+  ): T {
+    var lastError: Exception? = null
+    for (timeout in attempts) {
+      val restTemplate = buildRestTemplate(provider, Duration.ofSeconds(timeout.toLong()))
+      try {
+        return callback(restTemplate)
+      } catch (e: ResourceAccessException) {
+        lastError = e
+      }
+    }
+    throw FailedDependencyException(Message.LLM_PROVIDER_ERROR, listOf(lastError!!.message), lastError)
+  }
+
+  /**
+   * Every provider that names an endpoint goes through the same factory, and the only thing its origin decides is
+   * whether a private address is allowed: an organization-level `apiUrl` is user-supplied, so its connection pins
+   * DNS, matching what [validateApiUrl] already refuses at create time, while a server-configured one is the
+   * operator's own endpoint — routinely a private-network address such as a self-hosted inference server — and
+   * was never subject to that check.
+   *
+   * What neither of them does is follow a redirect. The provider's API key rides in plain headers, and
+   * httpclient5 copies those onto the hop — the same reason webhooks and SSO do not follow them. A configured
+   * endpoint answers the request it was given; one that answers with a `Location` is not the endpoint that was
+   * configured. A provider naming no endpoint at all has nothing to pin and nothing of ours to hand away.
+   */
+  private fun buildRestTemplate(
+    provider: LlmProviderDto,
+    timeout: Duration,
+  ): RestTemplate {
+    val apiUrl = provider.apiUrl
+    if (apiUrl.isNullOrBlank()) {
+      return restTemplateBuilder.readTimeout(timeout).build()
+    }
+    return restTemplateBuilder.build().apply {
+      requestFactory =
+        ssrfSafeRequestFactoryProvider.create(
+          allowLocalAddresses = provider.serverConfigured,
+          connectTimeout = timeout,
+          responseTimeout = timeout,
+          followRedirects = false,
+        )
+    }
+  }
+
+  fun getProviderByName(
+    organizationId: Long,
+    name: String,
+    priority: LlmProviderPriority?,
+  ): LlmProviderDto {
+    val customProviders =
+      if (adminMtServiceFilter.shouldSkipOrgLlmProviders(organizationId)) {
+        emptyList()
+      } else {
+        getAll(organizationId)
+      }
+    val serverProviders = getAllServerProviders()
+
+    val providersOfTheName =
+      if (customProviders.find { it.name == name } != null) {
+        customProviders
+      } else {
+        serverProviders
+      }.filter {
+        it.name == name
+      }
+
+    val providersWithPriority =
+      if (providersOfTheName.find { it.priority == priority } != null) {
+        providersOfTheName.filter { it.priority == priority }
+      } else {
+        providersOfTheName
+      }
+
+    if (providersWithPriority.isEmpty()) {
+      throw LlmProviderNotFoundException(name)
+    }
+
+    val providerInfo = resilientCacheAccessor.get(cache, name, ProviderInfo::class.java)
+    val providers =
+      providersWithPriority.filter {
+        if (providerInfo != null) {
+          providerInfo.suspendMap.getOrDefault(it.id, 0L) < currentDateProvider.date.time
+        } else {
+          true
+        }
+      }
+
+    if (providers.isEmpty() && providerInfo?.suspendMap?.isNotEmpty() == true) {
+      val closestUnsuspend = providerInfo.suspendMap.map { (_, time) -> time }.min()
+      throw LlmRateLimitedException(closestUnsuspend)
+    }
+
+    var lastUsed = lastUsedMap.get(name)
+    val lastUsedIndex = providers.indexOfFirst { it.id == lastUsed }
+    val newIndex = (lastUsedIndex + 1) % providers.size
+    val provider = providers.get(newIndex)
+    lastUsedMap.set(name, provider.id)
+    return provider
+  }
+
+  fun getProviderResponse(
+    providerService: AbstractLlmApiService,
+    params: LlmParams,
+    config: LlmProviderInterface,
+    restTemplate: RestTemplate,
+  ): PromptResult {
+    if (internalProperties.fakeLlmProviders) {
+      return getFakedResponse(config)
+    }
+    return providerService.translate(params, config, restTemplate)
+  }
+
+  fun getProviderService(providerType: LlmProviderType): AbstractLlmApiService {
+    return when (providerType) {
+      LlmProviderType.OPENAI -> openaiApiService
+      LlmProviderType.OPENAI_AZURE -> openaiApiService
+      LlmProviderType.TOLGEE -> tolgeeApiService
+      LlmProviderType.ANTHROPIC -> anthropicApiService
+      LlmProviderType.GOOGLE_AI -> googleAiApiService
+    }
+  }
+
+  fun calculatePrice(
+    providerConfig: LlmProviderDto,
+    usage: PromptResult.Usage?,
+  ): Int {
+    val tokenPriceInCreditsInput: Double = (providerConfig.tokenPriceInCreditsInput ?: 0.0)
+    val tokenPriceInCreditsOutput: Double = (providerConfig.tokenPriceInCreditsOutput ?: 0.0)
+    val inputTokens: Long = usage?.inputTokens ?: 0L
+    val outputTokens: Long = usage?.outputTokens ?: 0L
+    val cachedTokens: Long = usage?.cachedTokens ?: 0L
+
+    val inputPrice = (inputTokens - cachedTokens) * tokenPriceInCreditsInput
+    val outputPrice = (outputTokens) * tokenPriceInCreditsOutput
+
+    val price = inputPrice + outputPrice
+
+    return (price * 100).roundToInt()
+  }
+
+  fun suspendProvider(
+    name: String,
+    providerId: Long,
+  ) {
+    val providerInfo = resilientCacheAccessor.get(cache, name, ProviderInfo::class.java) ?: ProviderInfo()
+    providerInfo.suspendMap.set(providerId, currentDateProvider.date.time + RATE_LIMIT_SUSPEND_PERIOD_MS)
+    cache.set(name, providerInfo)
+  }
+
+  fun getFakedResponse(config: LlmProviderInterface): PromptResult {
+    val json =
+      """
+      {
+        "output": "response from: ${config.name}",
+        "contextDescription": "context description from: ${config.name}"
+      }
+      """.trimIndent()
+    return PromptResult(
+      response = json,
+      usage = PromptResult.Usage(inputTokens = 42, outputTokens = 21, cachedTokens = 1),
+    )
+  }
+
+  private fun validateApiUrl(apiUrl: String) {
+    if (apiUrl.isNotBlank()) {
+      urlSecurity.validateUrl(apiUrl)
+    }
+  }
+
+  companion object {
+    private const val RATE_LIMIT_SUSPEND_PERIOD_MS = 60000L
+
+    data class ProviderInfo(
+      var suspendMap: MutableMap<Long, Long> = mutableMapOf(),
+    )
+  }
+}

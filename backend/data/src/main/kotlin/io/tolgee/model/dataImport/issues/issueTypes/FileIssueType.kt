@@ -1,0 +1,19 @@
+package io.tolgee.model.dataImport.issues.issueTypes
+
+/** Ordinal-persisted by [io.tolgee.model.dataImport.issues.ImportFileIssue.type] — do not reorder. */
+enum class FileIssueType {
+  KEY_IS_NOT_STRING,
+  MULTIPLE_VALUES_FOR_KEY_AND_LANGUAGE,
+  VALUE_IS_NOT_STRING,
+  KEY_IS_EMPTY,
+  VALUE_IS_EMPTY,
+  PO_MSGCTXT_NOT_SUPPORTED,
+  ID_ATTRIBUTE_NOT_PROVIDED,
+  TARGET_NOT_PROVIDED,
+  TRANSLATION_TOO_LONG,
+  KEY_IS_BLANK,
+  TRANSLATION_DEFINED_IN_ANOTHER_FILE,
+  INVALID_CUSTOM_VALUES,
+  DESCRIPTION_TOO_LONG,
+  TRANSLATION_EXCEEDS_CHAR_LIMIT,
+}

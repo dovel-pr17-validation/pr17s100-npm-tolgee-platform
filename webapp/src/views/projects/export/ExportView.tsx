@@ -1,0 +1,32 @@
+import { FunctionComponent } from 'react';
+import { useTranslate } from '@tolgee/react';
+
+import { LINKS, PARAMS } from 'tg.constants/links';
+import { useProject } from 'tg.hooks/useProject';
+import { ExportForm } from './ExportForm';
+import { BaseProjectView } from '../BaseProjectView';
+
+export const ExportView: FunctionComponent<
+  React.PropsWithChildren<unknown>
+> = () => {
+  const project = useProject();
+  const { t } = useTranslate();
+
+  return (
+    <BaseProjectView
+      windowTitle={t('export_translations_title')}
+      navigation={[
+        [
+          t('export_translations_title'),
+          LINKS.PROJECT_EXPORT.build({
+            [PARAMS.PROJECT_ID]: project.id,
+          }),
+        ],
+      ]}
+      maxWidth="narrow"
+      branching
+    >
+      <ExportForm />
+    </BaseProjectView>
+  );
+};

@@ -1,0 +1,53 @@
+import { useTranslate } from '@tolgee/react';
+import { Tooltip } from '@mui/material';
+import { StyledBillingHint } from '../billing/Decorations';
+
+export const StringsHint: React.FC<React.PropsWithChildren<unknown>> = ({
+  children,
+}) => {
+  const { t } = useTranslate();
+  return (
+    <Tooltip disableInteractive title={t('global_strings_hint')}>
+      <StyledBillingHint>{children}</StyledBillingHint>
+    </Tooltip>
+  );
+};
+
+export const KeysHint: React.FC<React.PropsWithChildren<unknown>> = ({
+  children,
+}) => {
+  const { t } = useTranslate();
+  return (
+    <Tooltip disableInteractive title={t('global_keys_hint')}>
+      <StyledBillingHint>{children}</StyledBillingHint>
+    </Tooltip>
+  );
+};
+
+export const SeatsHint: React.FC<React.PropsWithChildren<unknown>> = ({
+  children,
+}) => {
+  const { t } = useTranslate();
+  return (
+    <Tooltip disableInteractive title={t('global_seats_hint')}>
+      <StyledBillingHint>{children}</StyledBillingHint>
+    </Tooltip>
+  );
+};
+
+export const WordsHint: React.FC<React.PropsWithChildren<unknown>> = ({
+  children,
+}) => {
+  const { t } = useTranslate();
+  return (
+    <Tooltip
+      disableInteractive
+      title={t(
+        'global_words_hint',
+        'Words in all filled translations of this project, counted in each language separately.'
+      )}
+    >
+      <StyledBillingHint>{children}</StyledBillingHint>
+    </Tooltip>
+  );
+};

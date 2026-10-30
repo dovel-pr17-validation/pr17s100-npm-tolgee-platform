@@ -1,0 +1,45 @@
+import { MenuProps, Menu } from '@mui/material';
+
+import { components } from 'tg.service/apiSchema.generated';
+import { useLanguagesContent } from 'tg.component/common/form/LanguagesSelect/useLanguagesContent';
+
+type LanguageModel = components['schemas']['LanguageModel'];
+
+type Props = {
+  anchorEl: MenuProps['anchorEl'];
+  onClose: () => void;
+  languages?: LanguageModel[];
+  disabledLanguages?: number[] | undefined;
+  value?: string[];
+  onChange: (languages: string[]) => void;
+};
+
+export const LanguagesMenu: React.FC<React.PropsWithChildren<Props>> = ({
+  anchorEl,
+  onClose,
+  languages,
+  value,
+  onChange,
+  disabledLanguages,
+}) => {
+  const languagesContent = useLanguagesContent({
+    languages: languages || [],
+    value: value || [],
+    onChange,
+    disabledLanguages,
+  });
+
+  return (
+    <Menu
+      anchorEl={anchorEl}
+      open={Boolean(anchorEl)}
+      onClose={onClose}
+      anchorOrigin={{
+        vertical: 'bottom',
+        horizontal: 'left',
+      }}
+    >
+      {languagesContent}
+    </Menu>
+  );
+};

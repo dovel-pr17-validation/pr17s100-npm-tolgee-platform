@@ -1,0 +1,137 @@
+package io.tolgee.component.reporting
+
+import com.posthog.server.PostHog
+import io.tolgee.component.reporting.PostHogGroupIdentifier.Companion.GROUP_TYPE
+import io.tolgee.dtos.cacheable.UserAccountDto
+import io.tolgee.service.organization.OrganizationService
+import io.tolgee.service.project.ProjectService
+import io.tolgee.service.security.UserAccountService
+import io.tolgee.util.filterValueNotNull
+import jakarta.persistence.EntityManager
+import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.context.annotation.Lazy
+import org.springframework.context.event.EventListener
+import org.springframework.scheduling.annotation.Async
+import org.springframework.stereotype.Component
+
+@Component
+class PostHogBusinessEventReporter(
+  private val postHog: PostHog?,
+  private val projectService: ProjectService,
+  private val organizationService: OrganizationService,
+  private val userAccountService: UserAccountService,
+  private val entityManager: EntityManager,
+  private var postHogGroupIdentifier: PostHogGroupIdentifier?,
+) {
+  @Lazy
+  @Autowired
+  private lateinit var selfProxied: PostHogBusinessEventReporter
+
+  @Async
+  fun captureAsync(data: OnBusinessEventToCaptureEvent) {
+    val filledData = fillOtherData(data)
+    captureWithPostHog(filledData)
+  }
+
+  @EventListener
+  fun capture(data: OnBusinessEventToCaptureEvent) {
+    if (postHog == null) return
+    selfProxied.captureAsync(data)
+  }
+
+  @EventListener
+  fun identify(data: OnIdentifyEvent) {
+    val dto = userAccountService.findDto(data.userAccountId) ?: return
+    postHog?.capture(
+      data.userAccountId.toString(),
+      "${'$'}identify",
+      mapOf(
+        "${'$'}anon_distinct_id" to data.anonymousUserId,
+        "${'$'}set" to getUserDataMap(dto),
+      ),
+    )
+  }
+
+  private fun captureWithPostHog(data: OnBusinessEventToCaptureEvent) {
+    val id = data.userAccountDto?.id ?: data.instanceId ?: data.anonymousUserId
+    val setEntry = getIdentificationMapForPostHog(data)
+
+    val map =
+      mapOf(
+        "${'$'}groups" to
+          mapOf(
+            "project" to data.projectDto?.id,
+            GROUP_TYPE to data.organizationId,
+          ),
+        "organizationId" to data.organizationId,
+        "organizationName" to data.organizationName,
+        "glossaryId" to data.glossaryId,
+      ) + (data.utmData ?: emptyMap()) + (data.data ?: emptyMap()) + setEntry
+
+    postHog?.capture(
+      id.toString(),
+      data.eventName,
+      map.filterValueNotNull(),
+    )
+
+    postHogGroupIdentifier?.identifyOrganization(organizationId = data.organizationId ?: return)
+  }
+
+  private fun getIdentificationMapForPostHog(data: OnBusinessEventToCaptureEvent): Map<String, Any?> {
+    val userSet = data.userAccountDto?.let { getUserDataMap(it) }
+    val instanceSet = data.instanceId?.let { mapOf("instanceId" to it) }
+    val baseSet = userSet.orEmpty() + instanceSet.orEmpty()
+
+    val merged = baseSet + data.personProperties?.filterValueNotNull().orEmpty()
+    if (merged.isEmpty()) return getAnonIdMap(data)
+
+    return mapOf("${'$'}set" to merged) + getAnonIdMap(data)
+  }
+
+  private fun getUserDataMap(userAccountDto: UserAccountDto): Map<String, Any?> =
+    mapOf(
+      "email" to userAccountDto.username,
+      "name" to userAccountDto.name,
+    )
+
+  fun getAnonIdMap(data: OnBusinessEventToCaptureEvent): Map<String, String> {
+    return (
+      data.anonymousUserId?.let {
+        mapOf(
+          "${'$'}anon_distinct_id" to data.anonymousUserId,
+        )
+      }
+    ) ?: emptyMap()
+  }
+
+  private fun fillOtherData(data: OnBusinessEventToCaptureEvent): OnBusinessEventToCaptureEvent {
+    val projectDto = data.projectDto ?: data.projectId?.let { projectService.findDto(it) }
+    val organizationId = data.organizationId ?: projectDto?.organizationOwnerId
+    val organizationName = data.organizationName ?: organizationId?.let { organizationService.get(it).name }
+    val userAccountId = data.userAccountId ?: findOwnerUserByOrganizationId(organizationId)
+    val userAccountDto = data.userAccountDto ?: userAccountId?.let { userAccountService.findDto(it) }
+    return data.copy(
+      projectDto = projectDto,
+      organizationId = organizationId,
+      organizationName = organizationName,
+      userAccountDto = userAccountDto,
+    )
+  }
+
+  private fun findOwnerUserByOrganizationId(organizationId: Long?): Long? {
+    organizationId ?: return null
+    return entityManager
+      .createQuery(
+        """
+      select u.id from UserAccount u 
+      join u.organizationRoles orl on orl.organization.id = :organizationId
+      where orl.type = io.tolgee.model.enums.OrganizationRoleType.OWNER
+      order by u.id
+      limit 1
+    """,
+        Long::class.java,
+      ).setParameter("organizationId", organizationId)
+      .resultList
+      .firstOrNull()
+  }
+}

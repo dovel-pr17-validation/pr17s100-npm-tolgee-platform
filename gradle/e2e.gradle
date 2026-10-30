@@ -1,0 +1,217 @@
+apply from: './gradle/utils.gradle'
+
+import groovy.io.FileType
+import groovy.json.JsonSlurper
+
+import java.time.Duration
+
+ext {
+    E2E_DIR = "${project.projectDir}/e2e"
+    WEBAPP_DIR = "${project.projectDir}/webapp"
+}
+
+def getE2eChunks() {
+    def totalJobs = System.getenv("E2E_TOTAL_JOBS")
+    def list = []
+
+    def dir = new File("$E2E_DIR/cypress/e2e")
+    dir.eachFileRecurse(FileType.FILES) { file ->
+        if (file.path.matches("^.*\\.tsx?${'$'}")) {
+            list.add(file.path.replace("$E2E_DIR/", ""))
+        }
+    }
+
+    list.sort()
+
+    if (totalJobs == null) {
+        return List.of(list)
+    }
+
+    def measured = measuredSpecSeconds()
+    def chunks = (1..Integer.parseInt(totalJobs)).collect { [] as List<String> }
+    def totals = new int[chunks.size()]
+    def longestFirst = list.toSorted { a, b -> seconds(measured, b) <=> seconds(measured, a) }
+    longestFirst.each { spec ->
+        def emptiest = (0..<totals.length).min { totals[it] }
+        chunks[emptiest].add(spec)
+        totals[emptiest] += seconds(measured, spec)
+    }
+    return chunks
+}
+
+def measuredSpecSeconds() {
+    return new JsonSlurper().parse(new File("$E2E_DIR/spec-durations.json"))
+}
+
+def seconds(Map measured, String spec) {
+    def defaultSeconds = 30
+    return measured.getOrDefault(spec, defaultSeconds)
+}
+
+def getE2eTestsToRun() {
+    def chunks = getE2eChunks()
+
+    def jobIndex = System.getenv("E2E_JOB_INDEX")
+
+    if (jobIndex == null) {
+        return chunks.flatten()
+    }
+
+    return chunks[Integer.parseInt(jobIndex)]
+}
+
+def getE2eSpecsOverride() {
+    def overrideSpecs = project.findProperty("specs")
+    if (overrideSpecs == null) {
+        return null
+    }
+    def trimmed = overrideSpecs.toString().trim()
+    return trimmed.isEmpty() ? null : trimmed
+}
+
+tasks.register('waitForRunningContainer', Task) {
+    doLast {
+        while (true) {
+            def pb = new ProcessBuilder(dockerCommandName(), "compose", "logs", "-f")
+            pb.directory(new File(E2E_DIR))
+            def proc = pb.start()
+            BufferedReader stdInput = new BufferedReader(new InputStreamReader(proc.getInputStream()))
+            String s = null
+            while ((s = stdInput.readLine()) != null) {
+                println(s)
+                if (s.contains("Tomcat started on port")) {
+                    return
+                }
+            }
+            if (proc.exitValue() != 0) {
+                throw new RuntimeException("docker compose logs returned non zero exit code")
+            }
+        }
+    }
+    timeout = Duration.ofSeconds(120)
+}
+
+tasks.register('installE2eDeps', Exec) {
+    group = 'e2e'
+    onlyIf { System.getenv("SKIP_INSTALL_E2E_DEPS") != "true" }
+    inputs.file("$E2E_DIR/package.json")
+    inputs.file("$E2E_DIR/package-lock.json")
+    outputs.dir("$E2E_DIR/node_modules")
+
+    commandLine npmCommandName, "install"
+    workingDir E2E_DIR
+}
+
+tasks.register('runE2e', Exec) {
+    group = 'e2e'
+    dependsOn "runDockerE2e", "installE2eDeps"
+    def overrideSpecs = getE2eSpecsOverride()
+    def specs = overrideSpecs != null ? overrideSpecs : getE2eTestsToRun().join(",")
+
+    def e2eHost = "http://localhost:${System.getenv('TOLGEE_E2E_PORT') ?: '8201'}"
+    environment     "CYPRESS_HOST", e2eHost
+    environment     "CYPRESS_API_URL", e2eHost
+    commandLine npmCommandName, "run", "cy:run", "--", "--spec", specs
+
+    workingDir E2E_DIR
+
+    finalizedBy "saveServerLogs", "stopDockerE2e", "cleanupDockerE2e"
+}
+
+tasks.register('printE2eGroups') {
+    group = 'e2e'
+    doLast {
+        def measured = measuredSpecSeconds()
+        def chunks = getE2eChunks()
+        chunks.indexed().forEach { index, chunk ->
+            println("Group $index: ${chunk.sum { seconds(measured, it) }}s")
+            chunk.forEach { println(" $it") }
+        }
+        def onDisk = chunks.flatten() as Set
+        (onDisk - measured.keySet()).each { println("not in spec-durations.json (counted as default): $it") }
+        (measured.keySet() - onDisk).each { println("in spec-durations.json but not on disk: $it") }
+    }
+}
+
+tasks.register('saveServerLogs', Exec) {
+    group = 'e2e'
+    workingDir = file(E2E_DIR)
+    def outFile = file("$E2E_DIR/server.log")
+    def outStream = null
+    doFirst {
+        outFile.parentFile.mkdirs()
+        outStream = new FileOutputStream(outFile)
+        standardOutput = outStream
+        errorOutput = outStream
+    }
+    commandLine dockerCommandName(), "compose", "logs"
+    ignoreExitValue = true
+    doLast {
+        try { outStream?.close() } catch (ignored) {}
+    }
+    finalizedBy "stopDockerE2e"
+}
+
+tasks.register('openE2e', Exec) {
+    group = 'e2e'
+    dependsOn "runDockerE2e", "installE2eDeps"
+
+    def overrideSpecs = getE2eSpecsOverride()
+    if (overrideSpecs != null) {
+        commandLine npmCommandName, "run", "cy:open", "--", "--spec", overrideSpecs
+    } else {
+        commandLine npmCommandName, "run", "cy:open"
+    }
+
+    workingDir E2E_DIR
+
+    finalizedBy "stopDockerE2e", "cleanupDockerE2e"
+}
+
+tasks.register('openE2eDev', Exec) {
+    def overrideSpecs = getE2eSpecsOverride()
+    if (overrideSpecs != null) {
+        commandLine npmCommandName, "run", "cy:open", "--", "--spec", overrideSpecs
+    } else {
+        commandLine npmCommandName, "run", "cy:open"
+    }
+
+    environment "CYPRESS_HOST", "http://localhost:8081"
+
+    workingDir E2E_DIR
+}
+
+tasks.register('runDockerE2e', Exec) {
+    group = 'e2e'
+    dependsOn "tagDockerLocal"
+    commandLine dockerCommandName(), "compose", "up", "-d"
+    workingDir E2E_DIR
+    finalizedBy "waitForRunningContainer"
+}
+
+tasks.register('runDockerE2eDev', Exec) {
+    group = 'e2e'
+    commandLine dockerCommandName(), "compose", "up", "-d", "fakesmtp"
+    workingDir E2E_DIR
+}
+
+tasks.register('stopDockerE2e', Exec) {
+    group = 'e2e'
+    commandLine dockerCommandName(), "compose", "stop"
+    workingDir E2E_DIR
+    ignoreExitValue = true
+    finalizedBy "cleanupDockerE2e"
+}
+
+tasks.register('cleanupDockerE2e', Exec) {
+    group = 'e2e'
+    commandLine dockerCommandName(), "compose", "rm", "-f"
+    workingDir E2E_DIR
+    ignoreExitValue = true
+}
+
+tasks.register('tagDockerLocal', Exec) {
+    group = 'e2e'
+    dependsOn "docker"
+    commandLine dockerCommandName(), "tag", "tolgee/tolgee", "tolgee/tolgee:local"
+}

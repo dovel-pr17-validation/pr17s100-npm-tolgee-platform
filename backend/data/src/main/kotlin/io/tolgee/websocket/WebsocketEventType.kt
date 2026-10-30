@@ -1,0 +1,15 @@
+package io.tolgee.websocket
+
+enum class WebsocketEventType {
+  TRANSLATION_DATA_MODIFIED,
+  BATCH_JOB_PROGRESS,
+  NOTIFICATIONS_CHANGED,
+  QA_ISSUES_UPDATED,
+  ;
+
+  val typeName get() = name.lowercase().replace("_", "-")
+
+  fun projectDestinationFor(projectId: Long) = "/projects/$projectId/$typeName"
+
+  fun userDestinationFor(userId: Long) = "/users/$userId/$typeName"
+}

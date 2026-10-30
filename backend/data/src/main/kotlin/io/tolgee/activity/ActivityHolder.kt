@@ -1,0 +1,100 @@
+package io.tolgee.activity
+
+import io.tolgee.activity.data.ActivityType
+import io.tolgee.activity.data.ModifiedCollectionKey
+import io.tolgee.activity.data.RevisionType
+import io.tolgee.activity.iterceptor.InterceptedEventsManager
+import io.tolgee.model.EntityWithId
+import io.tolgee.model.activity.ActivityDescribingEntity
+import io.tolgee.model.activity.ActivityModifiedEntity
+import io.tolgee.model.activity.ActivityRevision
+import jakarta.annotation.PreDestroy
+import org.springframework.context.ApplicationContext
+import kotlin.reflect.KClass
+
+open class ActivityHolder(
+  val applicationContext: ApplicationContext,
+) {
+  open var activity: ActivityType? = null
+    set(value) {
+      field = value
+      activityRevision.type = value
+    }
+
+  open var meta: MutableMap<String, Any?> = mutableMapOf()
+
+  open val activityRevision: ActivityRevision by lazy {
+    ActivityRevision()
+  }
+
+  /**
+   * Per-revision cache of pre-modification collection snapshots, keyed by
+   * `(entityClass, entityId, fieldName)`. Storing class+id rather than the
+   * entity instance lets `flushAndClear` actually free the owner entity instead
+   * of pinning it through this map for the whole transaction.
+   */
+  open var modifiedCollections: MutableMap<ModifiedCollectionKey, List<Any?>?> = mutableMapOf()
+
+  /**
+   * Allows forcing a specific revision type for an entity modification.
+   * Useful for soft-delete patterns where the entity is marked as deleted but not actually removed.
+   * Key: Pair of (entity class, entity id), Value: RevisionType to force
+   */
+  open var forcedRevisionTypes: MutableMap<Pair<KClass<out EntityWithId>, Long>, RevisionType> = mutableMapOf()
+
+  /**
+   * Force a specific revision type for an entity modification.
+   * Useful for soft-delete patterns where the entity is marked as deleted but not actually removed.
+   */
+  fun forceEntityRevisionType(
+    entity: EntityWithId,
+    revisionType: RevisionType,
+  ) {
+    forcedRevisionTypes[entity::class to entity.id] = revisionType
+  }
+
+  open var transactionRollbackOnly = false
+
+  open var organizationId: Long? = null
+
+  open var utmData: UtmData = null
+
+  open val businessEventData: MutableMap<String, String?> by lazy {
+    mutableMapOf()
+  }
+
+  /**
+   * This field stores all modified entities, it's stored before the transaction is committed
+   */
+  open var modifiedEntities:
+    ModifiedEntitiesType = mutableMapOf()
+
+  open var enableAutoCompletion: Boolean = true
+
+  open var afterActivityFlushed: (() -> Unit)? = null
+    set(value) {
+      this.applicationContext.getBean(InterceptedEventsManager::class.java).initActivityHolder()
+      field = value
+    }
+
+  var destroyer: (() -> Unit)? = null
+
+  open val describingRelationCache: MutableMap<Pair<Long, String>, ActivityDescribingEntity> by lazy {
+    activityRevision.describingRelations.associateBy { it.entityId to it.entityClass }.toMutableMap()
+  }
+
+  fun getDescribingRelationFromCache(
+    entityId: Long,
+    entityClass: String,
+    provider: () -> ActivityDescribingEntity,
+  ): ActivityDescribingEntity {
+    return describingRelationCache.getOrPut(entityId to entityClass, provider)
+  }
+
+  @PreDestroy
+  fun destroy() {
+    destroyer?.invoke()
+  }
+}
+
+typealias ModifiedEntitiesType = MutableMap<KClass<out EntityWithId>, MutableMap<Long, ActivityModifiedEntity>>

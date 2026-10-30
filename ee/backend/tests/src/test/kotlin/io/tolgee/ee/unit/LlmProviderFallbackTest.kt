@@ -1,0 +1,268 @@
+package io.tolgee.ee.unit
+
+import io.tolgee.component.CurrentDateProvider
+import io.tolgee.component.ResilientCacheAccessor
+import io.tolgee.component.adminMtServiceFilter.AdminMtServiceFilter
+import io.tolgee.configuration.tolgee.InternalProperties
+import io.tolgee.constants.Caches
+import io.tolgee.dtos.LlmParams
+import io.tolgee.dtos.LlmProviderDto
+import io.tolgee.ee.component.llm.AnthropicApiService
+import io.tolgee.ee.component.llm.GoogleAiApiService
+import io.tolgee.ee.component.llm.OpenaiApiService
+import io.tolgee.ee.component.llm.TolgeeApiService
+import io.tolgee.ee.service.LlmProviderResolver
+import io.tolgee.ee.service.LlmProviderService
+import io.tolgee.exceptions.LlmProviderNotFoundException
+import io.tolgee.model.enums.LlmProviderPriority
+import io.tolgee.model.enums.LlmProviderType
+import io.tolgee.repository.LlmProviderRepository
+import io.tolgee.service.LlmPropertiesService
+import io.tolgee.util.SsrfSafeRequestFactoryProvider
+import io.tolgee.util.UrlSecurity
+import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+import org.mockito.Mockito.mock
+import org.mockito.kotlin.any
+import org.mockito.kotlin.eq
+import org.mockito.kotlin.never
+import org.mockito.kotlin.verify
+import org.mockito.kotlin.whenever
+import org.springframework.boot.restclient.RestTemplateBuilder
+import org.springframework.cache.Cache
+import org.springframework.cache.CacheManager
+import org.springframework.http.client.ClientHttpRequestFactory
+import org.springframework.web.client.RestTemplate
+import java.util.Date
+
+// The ids keep the old convention for realism; what decides the branch under test is LlmProviderDto.serverConfigured.
+private const val SERVER_CONFIGURED_ID = -1L
+private const val ORG_LEVEL_ID = 7L
+
+class LlmProviderFallbackTest {
+  private lateinit var service: LlmProviderService
+  private lateinit var llmPropertiesService: LlmPropertiesService
+  private lateinit var llmProviderRepository: LlmProviderRepository
+  private lateinit var cacheManager: CacheManager
+  private lateinit var cache: Cache
+  private lateinit var openaiApiService: OpenaiApiService
+  private lateinit var internalProperties: InternalProperties
+  private lateinit var currentDateProvider: CurrentDateProvider
+  private lateinit var restTemplateBuilder: RestTemplateBuilder
+  private lateinit var adminMtServiceFilter: AdminMtServiceFilter
+  private lateinit var ssrfSafeRequestFactoryProvider: SsrfSafeRequestFactoryProvider
+
+  private val orgId = 1L
+
+  @BeforeEach
+  fun setUp() {
+    llmPropertiesService = mock()
+    llmProviderRepository = mock()
+    cacheManager = mock()
+    cache = mock()
+    openaiApiService = mock()
+    internalProperties = mock()
+    currentDateProvider = mock()
+    restTemplateBuilder = mock()
+    adminMtServiceFilter = mock()
+    ssrfSafeRequestFactoryProvider = mock()
+
+    whenever(cacheManager.getCache(Caches.LLM_PROVIDERS)).thenReturn(cache)
+    whenever(cache.get(any<String>(), any<Class<*>>())).thenReturn(null)
+    whenever(currentDateProvider.date).thenReturn(Date())
+    whenever(internalProperties.fakeLlmProviders).thenReturn(true)
+    whenever(openaiApiService.defaultAttempts()).thenReturn(listOf(30))
+    whenever(llmProviderRepository.getAll(orgId)).thenReturn(emptyList())
+
+    val restTemplate = mock<RestTemplate>()
+    whenever(restTemplateBuilder.readTimeout(any())).thenReturn(restTemplateBuilder)
+    whenever(restTemplateBuilder.build()).thenReturn(restTemplate)
+
+    val resolver =
+      LlmProviderResolver(
+        llmProviderRepository = llmProviderRepository,
+        llmPropertiesService = llmPropertiesService,
+        adminMtServiceFilter = adminMtServiceFilter,
+      )
+
+    service =
+      LlmProviderService(
+        llmProviderRepository = llmProviderRepository,
+        organizationService = mock(),
+        llmPropertiesService = llmPropertiesService,
+        openaiApiService = openaiApiService,
+        tolgeeApiService = mock<TolgeeApiService>(),
+        cacheManager = cacheManager,
+        currentDateProvider = currentDateProvider,
+        restTemplateBuilder = restTemplateBuilder,
+        internalProperties = internalProperties,
+        anthropicApiService = mock<AnthropicApiService>(),
+        googleAiApiService = mock<GoogleAiApiService>(),
+        llmProviderResolver = resolver,
+        urlSecurity = mock<UrlSecurity>(),
+        ssrfSafeRequestFactoryProvider = ssrfSafeRequestFactoryProvider,
+        adminMtServiceFilter = adminMtServiceFilter,
+        resilientCacheAccessor = ResilientCacheAccessor(),
+      )
+  }
+
+  @Test
+  fun `an organization-level provider's endpoint goes through the pinning factory`() {
+    whenever(
+      ssrfSafeRequestFactoryProvider.create(any(), any(), any(), any()),
+    ).thenReturn(mock<ClientHttpRequestFactory>())
+
+    service.repeatWithTimeouts(listOf(1), providerDto(apiUrl = "https://llm.example.com")) {}
+
+    verify(ssrfSafeRequestFactoryProvider).create(eq(false), any(), any(), eq(false))
+  }
+
+  @Test
+  fun `a server-config provider may be private, and still does not follow redirects`() {
+    whenever(
+      ssrfSafeRequestFactoryProvider.create(any(), any(), any(), any()),
+    ).thenReturn(mock<ClientHttpRequestFactory>())
+
+    service.repeatWithTimeouts(listOf(1), providerDto(apiUrl = "http://ollama:11434", serverConfigured = true)) {}
+
+    verify(ssrfSafeRequestFactoryProvider).create(eq(true), any(), any(), eq(false))
+  }
+
+  @Test
+  fun `a provider with no apiUrl keeps the ordinary template`() {
+    service.repeatWithTimeouts(listOf(1), providerDto(apiUrl = null)) {}
+
+    verify(ssrfSafeRequestFactoryProvider, never()).create(any(), any(), any(), any())
+  }
+
+  @Test
+  fun `provider found on first try - no fallback used`() {
+    setupServerProviders("openai")
+
+    val result = service.callProvider(orgId, "openai", createParams())
+
+    assertThat(result.response).contains("openai")
+  }
+
+  @Test
+  fun `fallback resolves when primary provider not found`() {
+    setupServerProviders("anthropic")
+    setupFallbacks("openai" to "anthropic")
+
+    val result = service.callProvider(orgId, "openai", createParams())
+
+    assertThat(result.response).contains("anthropic")
+  }
+
+  @Test
+  fun `chain of length 2 resolves`() {
+    setupServerProviders("google-ai")
+    setupFallbacks("openai" to "anthropic", "anthropic" to "google-ai")
+
+    val result = service.callProvider(orgId, "openai", createParams())
+
+    assertThat(result.response).contains("google-ai")
+  }
+
+  @Test
+  fun `throws when no fallback configured`() {
+    setupServerProviders()
+
+    assertThatThrownBy {
+      service.callProvider(orgId, "openai", createParams())
+    }.isInstanceOf(LlmProviderNotFoundException::class.java)
+  }
+
+  @Test
+  fun `circular fallback chain throws - no infinite loop`() {
+    setupServerProviders()
+    setupFallbacks("openai" to "anthropic", "anthropic" to "openai")
+
+    assertThatThrownBy {
+      service.callProvider(orgId, "openai", createParams())
+    }.isInstanceOf(LlmProviderNotFoundException::class.java)
+  }
+
+  @Test
+  fun `default alias resolves to server default provider`() {
+    setupServerProviders("gpt-6", "claude")
+    whenever(llmPropertiesService.getDefaultProviderName()).thenReturn("claude")
+
+    val result = service.callProvider(orgId, "default", createParams())
+
+    assertThat(result.response).contains("claude")
+  }
+
+  @Test
+  fun `real provider named default wins over the alias`() {
+    setupServerProviders("default", "gpt-6")
+    whenever(llmPropertiesService.getDefaultProviderName()).thenReturn("gpt-6")
+
+    val result = service.callProvider(orgId, "default", createParams())
+
+    assertThat(result.response).contains("default")
+  }
+
+  @Test
+  fun `default alias throws when no providers exist`() {
+    setupServerProviders()
+
+    assertThatThrownBy {
+      service.callProvider(orgId, "default", createParams())
+    }.isInstanceOf(LlmProviderNotFoundException::class.java)
+  }
+
+  private fun setupServerProviders(vararg names: String) {
+    whenever(llmPropertiesService.getProviders()).thenReturn(
+      names.mapIndexed { index, name ->
+        io.tolgee.configuration.tolgee.machineTranslation.LlmProperties.LlmProvider(
+          name = name,
+          type = LlmProviderType.OPENAI,
+        )
+      },
+    )
+  }
+
+  private fun setupFallbacks(vararg pairs: Pair<String, String>) {
+    for ((from, to) in pairs) {
+      whenever(llmPropertiesService.getFallbackProviderName(from)).thenReturn(to)
+    }
+  }
+
+  private fun providerDto(
+    apiUrl: String?,
+    serverConfigured: Boolean = false,
+  ) = LlmProviderDto(
+    id = SERVER_CONFIGURED_ID.takeIf { serverConfigured } ?: ORG_LEVEL_ID,
+    name = "p",
+    type = LlmProviderType.OPENAI,
+    priority = null,
+    apiKey = null,
+    rawApiUrl = apiUrl,
+    model = null,
+    deployment = null,
+    format = null,
+    reasoningEffort = null,
+    tokenPriceInCreditsInput = null,
+    tokenPriceInCreditsOutput = null,
+    attempts = null,
+    maxTokens = 0,
+    serverConfigured = serverConfigured,
+  )
+
+  private fun createParams(): LlmParams {
+    return LlmParams(
+      messages =
+        listOf(
+          LlmParams.Companion.LlmMessage(
+            type = LlmParams.Companion.LlmMessageType.TEXT,
+            text = "Translate 'hello' to Czech",
+          ),
+        ),
+      shouldOutputJson = false,
+      priority = LlmProviderPriority.HIGH,
+    )
+  }
+}

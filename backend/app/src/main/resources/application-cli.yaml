@@ -1,0 +1,20 @@
+tolgee:
+  authentication:
+    registrationsAllowed: false
+    initialUsername: admin
+    initialPassword: admin
+  rateLimits:
+    enabled: false
+  internal:
+    showVersion: true
+    controllerEnabled: true
+  import:
+    createImplicitApiKey: true
+    baseLanguageTag: en
+  postgres-autostart:
+    container-name: ${TOLGEE_CLI_PG_CONTAINER:tolgee-postgres-cli}
+    port: ${TOLGEE_CLI_PG_PORT:64321}
+  billing:
+    enabled: false
+server:
+  port: ${TOLGEE_CLI_PORT:22222}

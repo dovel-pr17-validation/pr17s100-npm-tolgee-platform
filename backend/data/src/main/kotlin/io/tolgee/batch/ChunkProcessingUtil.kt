@@ -1,0 +1,260 @@
+package io.tolgee.batch
+
+import io.opentelemetry.api.trace.Span
+import io.opentelemetry.instrumentation.annotations.WithSpan
+import io.sentry.Sentry
+import io.tolgee.Metrics
+import io.tolgee.activity.ActivityHolder
+import io.tolgee.batch.data.BatchJobDto
+import io.tolgee.component.CurrentDateProvider
+import io.tolgee.exceptions.ExceptionWithMessage
+import io.tolgee.model.batch.BatchJob
+import io.tolgee.model.batch.BatchJobChunkExecution
+import io.tolgee.model.batch.BatchJobChunkExecutionStatus
+import io.tolgee.service.project.ProjectService
+import io.tolgee.util.Logging
+import io.tolgee.util.logger
+import jakarta.persistence.EntityManager
+import org.apache.commons.lang3.exception.ExceptionUtils
+import org.hibernate.Timeouts
+import org.springframework.context.ApplicationContext
+import tools.jackson.module.kotlin.jacksonObjectMapper
+import java.util.Date
+import kotlin.collections.sorted
+import kotlin.coroutines.CoroutineContext
+import kotlin.math.pow
+import kotlin.system.measureTimeMillis
+
+open class ChunkProcessingUtil(
+  val execution: BatchJobChunkExecution,
+  private val applicationContext: ApplicationContext,
+  private val coroutineContext: CoroutineContext,
+  private val batchJobDto: BatchJobDto? = null,
+) : Logging {
+  @WithSpan
+  open fun processChunk() {
+    // Add batch job span attributes for tracing
+    val span = Span.current()
+    span.setAttribute("batch.job.id", job.id)
+    span.setAttribute("batch.job.type", job.type.name)
+    span.setAttribute("batch.chunk.execution.id", execution.id)
+    span.setAttribute("batch.chunk.number", execution.chunkNumber.toLong())
+
+    val time =
+      measureTimeMillis {
+        try {
+          handleActivity()
+          processor.process(job, toProcess, coroutineContext)
+          successfulTargets = toProcess
+          execution.status = BatchJobChunkExecutionStatus.SUCCESS
+        } catch (e: Throwable) {
+          handleException(e)
+        } finally {
+          successfulTargets?.let {
+            execution.successTargets = it
+          }
+        }
+      }
+
+    // Record chunk execution time metric
+    metrics.recordChunkExecutionTime(job.type.name, execution.status.name, time)
+
+    logger.debug("Chunk ${execution.id} executed in ${time}ms")
+  }
+
+  private fun handleActivity() {
+    val activityRevision = activityHolder.activityRevision
+    activityRevision.batchJobChunkExecution = execution
+    job.projectId?.let {
+      val project = projectService.getDto(it)
+      activityRevision.projectId = project.id
+      activityRevision.organizationId = project.organizationOwnerId
+    }
+    activityHolder.activity = job.type.activityType
+    activityRevision.authorId = job.authorId
+  }
+
+  private fun handleException(exception: Throwable) {
+    if (exception is kotlinx.coroutines.CancellationException) {
+      execution.status = BatchJobChunkExecutionStatus.CANCELLED
+      return
+    }
+
+    execution.status = BatchJobChunkExecutionStatus.FAILED
+    execution.errorMessage = (exception as? ExceptionWithMessage)?.tolgeeMessage
+    if (exception !is MultipleItemsFailedException) {
+      execution.stackTrace = exception.stackTraceToString().take(MAX_STACK_TRACE_LENGTH)
+      execution.errorKey = ExceptionUtils.getRootCause(exception)?.javaClass?.simpleName
+    } else {
+      execution.stackTrace =
+        exception.exceptions
+          .distinctBy { it.code }
+          .mapIndexed { index, e -> "Exception $index:\n${e.stackTraceToString()}" }
+          .joinToString("\n\n")
+          .take(MAX_STACK_TRACE_LENGTH)
+      execution.errorKey =
+        exception.exceptions
+          .map { ExceptionUtils.getRootCause(it)?.javaClass?.simpleName }
+          .filterNotNull()
+          .distinct()
+          .sorted()
+          .joinToString(",")
+    }
+
+    ChunkFailureLogger.log(exception)
+
+    if (exception is HasSuccessfulTargets) {
+      successfulTargets = exception.successfulTargets
+      successfulTargets?.let { execution.successTargets = it }
+    }
+
+    if (exception is FailedDontRequeueException) {
+      return
+    }
+
+    retryFailedExecution(exception)
+  }
+
+  private fun retryFailedExecution(exception: Throwable) {
+    var maxRetries = job.type.maxRetries
+    var waitTime = job.type.defaultRetryWaitTimeInMs
+
+    if (exception is ChunkItemFailedException) {
+      maxRetries = exception.maxRetries
+      waitTime = getWaitTime(exception)
+    } else if (exception is MultipleItemsFailedException) {
+      // do not retry more than a minimum number required among all exceptions
+      maxRetries = exception.exceptions.minOfOrNull { it.maxRetries } ?: maxRetries
+      // do wait for the maximum amount of time among all exceptions
+      waitTime = exception.exceptions.maxOfOrNull { getWaitTime(it) } ?: waitTime
+    }
+
+    logger.debug(
+      "Total retries ${retries.values.sum()}, " +
+        "retries for error key: $errorKeyRetries, max retries $maxRetries",
+    )
+    if (errorKeyRetries >= maxRetries && maxRetries != -1) {
+      logger.debug("Max retries reached for job execution ${execution.id}")
+      if (!ChunkFailureLogger.isExpectedUserError(exception)) {
+        Sentry.captureException(exception)
+      }
+      return
+    }
+
+    logger.debug("Retrying job execution ${execution.id} in ${waitTime}ms")
+    retryExecution.executeAfter = Date(waitTime + currentDateProvider.date.time)
+    execution.retry = true
+  }
+
+  private fun getWaitTime(exception: ChunkItemFailedException) =
+    exception.delayInMs * (exception.increaseFactor.toDouble().pow(errorKeyRetries.toDouble())).toInt()
+
+  private val job by lazy { batchJobDto ?: batchJobService.getJobDto(execution.batchJob.id) }
+
+  private val activityHolder by lazy {
+    applicationContext.getBean(ActivityHolder::class.java)
+  }
+
+  private val entityManager by lazy {
+    applicationContext.getBean(EntityManager::class.java)
+  }
+
+  private val currentDateProvider by lazy {
+    applicationContext.getBean(CurrentDateProvider::class.java)
+  }
+
+  private val batchJobService by lazy {
+    applicationContext.getBean(BatchJobService::class.java)
+  }
+
+  private val progressManager by lazy {
+    applicationContext.getBean(ProgressManager::class.java)
+  }
+
+  private val processor by lazy {
+    batchJobService.getProcessor(job.type)
+  }
+
+  private val projectService by lazy {
+    applicationContext.getBean(ProjectService::class.java)
+  }
+
+  private val metrics by lazy {
+    applicationContext.getBean(Metrics::class.java)
+  }
+
+  private var successfulTargets: List<Any>? = null
+
+  private val toProcess by lazy {
+    val toProcess = chunk.toMutableSet()
+    toProcess.removeAll(previousSuccessfulTargets)
+    toProcess.toList()
+  }
+
+  private val previousSuccessfulTargets by lazy {
+    previousExecutions
+      .flatMap {
+        // this is important!!
+        // we want the equals check to be run on the correct type with correct class instances
+        convertChunkToItsType(it.successTargets)
+      }.toSet()
+  }
+
+  /**
+   * We need to convert the chunk to the right type, so we pass it to the processor correctly
+   *
+   * e.g. It can happen that the chunk is converted to a list of integers for caching, but
+   * we actually need a list of Long
+   */
+  private val chunk by lazy {
+    val chunked = job.chunkedTarget
+    val chunk = chunked[execution.chunkNumber]
+    convertChunkToItsType(chunk)
+  }
+
+  private fun convertChunkToItsType(chunk: List<Any>): List<Any> {
+    val type =
+      jacksonObjectMapper().typeFactory.constructCollectionType(List::class.java, processor.getTargetItemType())
+    return jacksonObjectMapper().convertValue(chunk, type) as List<Any>
+  }
+
+  val retryExecution: BatchJobChunkExecution by lazy {
+    BatchJobChunkExecution().apply {
+      batchJob = entityManager.getReference(BatchJob::class.java, job.id)
+      chunkNumber = execution.chunkNumber
+      status = BatchJobChunkExecutionStatus.PENDING
+    }
+  }
+
+  private val errorKeyRetries by lazy {
+    val errorKey = execution.errorKey ?: throw IllegalStateException("Error key is not set")
+    retries[errorKey] ?: 0
+  }
+
+  private val retries: Map<String?, Long> by lazy {
+    previousExecutions.groupBy { it.errorKey }.map { it.key to it.value.size.toLong() }.toMap()
+  }
+
+  @Suppress("UNCHECKED_CAST")
+  private val previousExecutions: List<BatchJobChunkExecution> by lazy {
+    entityManager
+      .createQuery(
+        """
+        from BatchJobChunkExecution 
+        where chunkNumber = :chunkNumber 
+            and batchJob.id = :batchJobId
+            and status = :status
+        """.trimIndent(),
+      ).setParameter("chunkNumber", execution.chunkNumber)
+      .setParameter("batchJobId", job.id)
+      .setParameter("status", BatchJobChunkExecutionStatus.FAILED)
+      .setHint(
+        "jakarta.persistence.lock.timeout",
+        Timeouts.NO_WAIT_MILLI,
+      ).resultList as List<BatchJobChunkExecution>
+  }
+
+  companion object {
+    private const val MAX_STACK_TRACE_LENGTH = 65535
+  }
+}

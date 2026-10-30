@@ -1,0 +1,118 @@
+/**
+ * Copyright (C) 2023 Tolgee s.r.o. and contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *         http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.tolgee.util
+
+import io.micrometer.core.instrument.Timer
+import io.sentry.Sentry
+import io.tolgee.Metrics
+import io.tolgee.exceptions.ErrorException
+import io.tolgee.exceptions.ErrorResponseBody
+import io.tolgee.exceptions.ExpectedException
+import io.tolgee.exceptions.NotFoundException
+import jakarta.persistence.EntityManager
+import org.hibernate.Session
+import org.springframework.http.ResponseEntity
+import org.springframework.stereotype.Component
+import org.springframework.web.context.request.RequestContextHolder
+import org.springframework.web.context.request.ServletRequestAttributes
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody
+import tools.jackson.databind.ObjectMapper
+import java.io.OutputStream
+import java.io.OutputStreamWriter
+
+@Component
+class StreamingResponseBodyProvider(
+  private val entityManager: EntityManager,
+  private val objectMapper: ObjectMapper,
+  private val metrics: Metrics,
+) : Logging {
+  fun createStreamingResponseBody(
+    streamType: StreamType,
+    fn: (os: OutputStream) -> Unit,
+  ): StreamingResponseBody {
+    val request = (RequestContextHolder.getRequestAttributes() as? ServletRequestAttributes)?.request
+    return StreamingResponseBody {
+      request?.setAttribute(STREAM_STARTED_ATTRIBUTE, true)
+      val sample = Timer.start()
+      val session = entityManager.unwrap(Session::class.java)
+      try {
+        session.doWork { connection ->
+          try {
+            fn(it)
+          } finally {
+            // Manually dispose the connection because spring has a hard time doing so by itself
+            connection.close()
+          }
+        }
+      } finally {
+        sample.stop(metrics.streamDurationTimer(streamType))
+        session.close()
+      }
+    }
+  }
+
+  fun streamNdJson(
+    streamType: StreamType,
+    stream: (write: (message: Any?) -> Unit) -> Unit,
+  ): ResponseEntity<StreamingResponseBody> {
+    return ResponseEntity.ok().disableAccelBuffering().body(
+      this.createStreamingResponseBody(streamType) { outputStream ->
+        OutputStreamWriter(outputStream).use { writer ->
+          val write =
+            { message: Any? -> writer.writeJson(message) }
+          try {
+            stream(write)
+          } catch (e: Throwable) {
+            val message = getErrorMessage(e)
+            writer.writeJson(StreamedErrorMessage(message))
+            logger.debug("Error while streaming response body", e)
+            if (e !is ExpectedException) {
+              Sentry.captureException(e)
+            }
+          }
+        }
+      },
+    )
+  }
+
+  fun OutputStreamWriter.writeJson(message: Any?) {
+    this.write(
+      (objectMapper.writeValueAsString(message) + "\n"),
+    )
+    this.flush()
+  }
+
+  companion object {
+    /** Distinguishes a stream that never left the queue from one that ran; see ExceptionHandlers. */
+    const val STREAM_STARTED_ATTRIBUTE = "io.tolgee.streamStarted"
+  }
+
+  private fun getErrorMessage(e: Throwable) =
+    when (e) {
+      is NotFoundException -> ErrorResponseBody(e.msg.code, null)
+      is ErrorException -> e.errorResponseBody
+      else ->
+        ErrorResponseBody(
+          "unexpected_error_occurred",
+          listOf(e::class.java.name),
+        )
+    }
+
+  data class StreamedErrorMessage(
+    val error: ErrorResponseBody,
+  )
+}

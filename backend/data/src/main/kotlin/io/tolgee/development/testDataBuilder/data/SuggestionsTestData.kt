@@ -1,0 +1,354 @@
+package io.tolgee.development.testDataBuilder.data
+
+import io.tolgee.development.testDataBuilder.builders.ApiKeyBuilder
+import io.tolgee.development.testDataBuilder.builders.KeyBuilder
+import io.tolgee.development.testDataBuilder.builders.ProjectBuilder
+import io.tolgee.development.testDataBuilder.builders.SuggestionBuilder
+import io.tolgee.development.testDataBuilder.builders.TranslationBuilder
+import io.tolgee.development.testDataBuilder.builders.UserAccountBuilder
+import io.tolgee.model.Language
+import io.tolgee.model.UserAccount
+import io.tolgee.model.enums.OrganizationRoleType
+import io.tolgee.model.enums.ProjectPermissionType
+import io.tolgee.model.enums.Scope
+import io.tolgee.model.enums.SuggestionsMode
+import io.tolgee.model.enums.TranslationState
+
+class SuggestionsTestData(
+  suggestionsMode: SuggestionsMode = SuggestionsMode.DISABLED,
+) : BaseTestData("suggestionsuggestionsTestUser", "Project with suggestions") {
+  var projectReviewer: UserAccountBuilder
+  var orgAdmin: UserAccountBuilder
+  var orgMember: UserAccountBuilder
+  var projectTranslator: UserAccountBuilder
+  var czechTranslator: UserAccountBuilder
+  var czechReviewer: UserAccountBuilder
+  var communityUser: UserAccountBuilder
+  var suggestionModerator: UserAccountBuilder
+  var czechSuggestionModerator: UserAccountBuilder
+  var serverAdmin: UserAccountBuilder
+  var projectEditor: UserAccountBuilder
+  var viewOnlyUser: UserAccountBuilder
+  var granularSuggester: UserAccountBuilder
+  var relatedProject: ProjectBuilder
+  lateinit var ownAccessApiKey: ApiKeyBuilder
+  lateinit var ownAccessOnlyApiKey: ApiKeyBuilder
+  var keys: MutableList<KeyBuilder> = mutableListOf()
+  val czechSuggestions: MutableList<SuggestionBuilder> = mutableListOf()
+  lateinit var translatorsCzechSuggestion: SuggestionBuilder
+  lateinit var reviewersCzechSuggestion: SuggestionBuilder
+  val englishSuggestions: MutableList<SuggestionBuilder> = mutableListOf()
+  var czechReviewerEnglishSuggestion: SuggestionBuilder
+  val czechTranslations: MutableList<TranslationBuilder> = mutableListOf()
+  var pluralKey: KeyBuilder
+  var pluralSuggestion: SuggestionBuilder
+  lateinit var czechLanguage: Language
+
+  // A separate project (different org) with its own key + suggestion.
+  // Used to verify that access to a suggestion by id from another project is rejected.
+  var unrelatedProject: ProjectBuilder
+  var unrelatedKey: KeyBuilder
+  var unrelatedSuggestion: SuggestionBuilder
+
+  init {
+    user.name = "Tasks test user"
+    projectReviewer =
+      root.addUserAccount {
+        username = "reviewer@test.com"
+        name = "Project reviewer"
+      }
+
+    orgMember =
+      root.addUserAccount {
+        username = "organization.member@test.com"
+        name = "Organization member"
+      }
+
+    orgAdmin =
+      root.addUserAccount {
+        username = "organization.owner@test.com"
+        name = "Organization owner"
+      }
+
+    projectTranslator =
+      root.addUserAccount {
+        username = "translator@test.com"
+        name = "Project translator"
+      }
+
+    czechTranslator =
+      root.addUserAccount {
+        username = "cs.translator@test.com"
+        name = "Czech translator"
+      }
+
+    czechReviewer =
+      root.addUserAccount {
+        username = "cs.reviewer@test.com"
+        name = "Czech reviewer"
+      }
+
+    communityUser =
+      root.addUserAccount {
+        username = "community@test.com"
+        name = "Community user"
+      }
+
+    suggestionModerator =
+      root.addUserAccount {
+        username = "suggestion.moderator@test.com"
+        name = "Suggestion moderator"
+      }
+
+    czechSuggestionModerator =
+      root.addUserAccount {
+        username = "cs.suggestion.moderator@test.com"
+        name = "Czech suggestion moderator"
+      }
+
+    serverAdmin =
+      root.addUserAccount {
+        username = "server.admin@test.com"
+        name = "Server admin"
+        role = UserAccount.Role.ADMIN
+      }
+
+    projectEditor =
+      root.addUserAccount {
+        username = "editor@test.com"
+        name = "Project editor"
+      }
+
+    viewOnlyUser =
+      root.addUserAccount {
+        username = "view.only@test.com"
+        name = "View only user"
+      }
+
+    granularSuggester =
+      root.addUserAccount {
+        username = "granular.suggester@test.com"
+        name = "Granular suggester"
+      }
+
+    userAccountBuilder.defaultOrganizationBuilder.apply {
+      addRole {
+        user = orgMember.self
+        type = OrganizationRoleType.MEMBER
+      }
+
+      addRole {
+        user = orgAdmin.self
+        type = OrganizationRoleType.OWNER
+      }
+    }
+
+    projectBuilder.apply {
+      relatedProject = this
+
+      this.self.suggestionsMode = suggestionsMode
+
+      ownAccessApiKey =
+        addApiKey {
+          key = "own-access-api-key"
+          scopesEnum = mutableSetOf(Scope.TRANSLATIONS_VIEW, Scope.TRANSLATION_SUGGESTIONS_OWN_ACCESS)
+          userAccount = projectReviewer.self
+        }
+      ownAccessOnlyApiKey =
+        addApiKey {
+          key = "own-access-only-api-key"
+          scopesEnum = mutableSetOf(Scope.TRANSLATION_SUGGESTIONS_OWN_ACCESS)
+          userAccount = projectReviewer.self
+        }
+
+      addLanguage {
+        name = "Czech"
+        tag = "cs"
+        originalName = "Čeština"
+        czechLanguage = this
+      }
+
+      addPermission {
+        user = projectReviewer.self
+        type = ProjectPermissionType.REVIEW
+      }
+
+      addPermission {
+        user = projectTranslator.self
+        type = ProjectPermissionType.TRANSLATE
+      }
+
+      addPermission {
+        user = czechTranslator.self
+        type = ProjectPermissionType.TRANSLATE
+        viewLanguages = mutableSetOf(czechLanguage)
+        translateLanguages = mutableSetOf(czechLanguage)
+        suggestLanguages = mutableSetOf(czechLanguage)
+      }
+
+      addPermission {
+        user = czechReviewer.self
+        type = ProjectPermissionType.REVIEW
+        translateLanguages = mutableSetOf(czechLanguage)
+        suggestLanguages = mutableSetOf(czechLanguage)
+        stateChangeLanguages = mutableSetOf(czechLanguage)
+      }
+
+      addPermission {
+        user = projectEditor.self
+        type = ProjectPermissionType.EDIT
+      }
+
+      addPermission {
+        user = viewOnlyUser.self
+        type = ProjectPermissionType.VIEW
+      }
+
+      addPermission {
+        user = suggestionModerator.self
+        type = null
+        scopes = arrayOf(Scope.TRANSLATIONS_VIEW, Scope.TRANSLATION_SUGGESTIONS_MANAGE)
+      }
+
+      addPermission {
+        user = czechSuggestionModerator.self
+        type = null
+        scopes = arrayOf(Scope.TRANSLATIONS_VIEW, Scope.TRANSLATION_SUGGESTIONS_MANAGE)
+        suggestManageLanguages = mutableSetOf(czechLanguage)
+      }
+
+      addPermission {
+        user = granularSuggester.self
+        type = null
+        scopes = arrayOf(Scope.TRANSLATIONS_VIEW, Scope.TRANSLATIONS_SUGGEST)
+      }
+
+      (0 until 4).forEach {
+        keys.add(
+          addKey(null, "key $it").apply {
+            addTranslation("en", "Translation $it").apply {
+              self.state = TranslationState.REVIEWED
+            }
+            addTranslation("cs", "Překlad $it").apply {
+              self.state = TranslationState.REVIEWED
+              czechTranslations.add(this)
+            }
+          },
+        )
+      }
+
+      keys[0].apply {
+        translatorsCzechSuggestion =
+          addSuggestion {
+            this.language = czechLanguage
+            this.author = projectTranslator.self
+            this.translation = "Navržený překlad 0-1"
+          }
+        czechSuggestions.add(translatorsCzechSuggestion)
+
+        reviewersCzechSuggestion =
+          addSuggestion {
+            this.language = czechLanguage
+            this.author = projectReviewer.self
+            this.translation = "Navržený překlad 0-2"
+          }
+        czechSuggestions.add(reviewersCzechSuggestion)
+
+        englishSuggestions.add(
+          addSuggestion {
+            this.language = englishLanguage
+            this.author = projectTranslator.self
+            this.translation = "Suggested translation 0-1"
+          },
+        )
+
+        englishSuggestions.add(
+          addSuggestion {
+            this.language = englishLanguage
+            this.author = projectReviewer.self
+            this.translation = "Suggested translation 0-2"
+          },
+        )
+      }
+
+      czechTranslations[0].apply {
+        addComment {
+          text = "Member comment"
+          author = this@SuggestionsTestData.user
+        }
+      }
+
+      keys[2].apply {
+        (1..4).forEach { i ->
+          addSuggestion {
+            this.language = czechLanguage
+            this.author = projectTranslator.self
+            this.translation = "Many suggestion 2-$i"
+          }
+        }
+      }
+
+      keys[3].apply {
+        addSuggestion {
+          this.language = czechLanguage
+          this.author = projectTranslator.self
+          this.translation = "Only suggestion 3-1"
+        }
+
+        czechReviewerEnglishSuggestion =
+          addSuggestion {
+            this.language = englishLanguage
+            this.author = czechReviewer.self
+            this.translation = "Suggested translation 3 by cs reviewer"
+          }
+      }
+
+      pluralKey =
+        addKey(null, "pluralKey").apply {
+          self.isPlural = true
+          addTranslation("en", "{value, plural, one {# key} other {# keys}}")
+          addTranslation("cs", "{value, plural, one {# klíč} few {# klíče} other {# klíčů}}")
+          pluralSuggestion =
+            addSuggestion {
+              this.language = czechLanguage
+              this.author = projectTranslator.self
+              this.translation = "{value, plural, one {# překlad} few {# překlady} other {# překladů}}"
+              this.isPlural = true
+            }
+        }
+    }
+
+    val unrelatedUser =
+      root.addUserAccount {
+        username = "unrelated.suggester@test.com"
+        name = "Unrelated suggester"
+      }
+
+    unrelatedProject =
+      root.addProject {
+        name = "Unrelated suggestions project"
+      }
+
+    unrelatedProject.apply {
+      val unrelatedEnglish = addEnglish()
+      self.suggestionsMode = SuggestionsMode.ENABLED
+      unrelatedKey =
+        addKey(null, "unrelated key").apply {
+          addTranslation("en", "Unrelated translation")
+          unrelatedSuggestion =
+            addSuggestion {
+              this.language = unrelatedEnglish.self
+              this.author = unrelatedUser.self
+              this.translation = "Unrelated suggested translation"
+            }
+        }
+    }
+  }
+
+  fun disableTranslation() {
+    val translation = czechTranslations[0].self
+
+    translation.state = TranslationState.DISABLED
+    translation.text = null
+  }
+}

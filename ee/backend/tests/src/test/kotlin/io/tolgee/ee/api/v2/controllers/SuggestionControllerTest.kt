@@ -1,0 +1,698 @@
+package io.tolgee.ee.api.v2.controllers
+
+import io.tolgee.ProjectAuthControllerTest
+import io.tolgee.constants.Message
+import io.tolgee.development.testDataBuilder.data.SuggestionsTestData
+import io.tolgee.dtos.request.key.ComplexEditKeyDto
+import io.tolgee.ee.data.translationSuggestion.CreateTranslationSuggestionRequest
+import io.tolgee.ee.repository.TranslationSuggestionRepository
+import io.tolgee.fixtures.andAssertThatJson
+import io.tolgee.fixtures.andHasErrorMessage
+import io.tolgee.fixtures.andIsBadRequest
+import io.tolgee.fixtures.andIsConflict
+import io.tolgee.fixtures.andIsForbidden
+import io.tolgee.fixtures.andIsNotFound
+import io.tolgee.fixtures.andIsOk
+import io.tolgee.fixtures.node
+import io.tolgee.model.enums.Scope
+import io.tolgee.model.enums.SuggestionsMode
+import io.tolgee.model.enums.TranslationSuggestionState
+import io.tolgee.testing.annotations.ProjectApiKeyAuthTestMethod
+import io.tolgee.testing.annotations.ProjectJWTAuthTestMethod
+import io.tolgee.testing.assert
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Test
+import org.springframework.beans.factory.annotation.Autowired
+import java.math.BigDecimal
+import java.util.Date
+
+class SuggestionControllerTest : ProjectAuthControllerTest("/v2/projects/") {
+  lateinit var testData: SuggestionsTestData
+
+  @Autowired
+  private lateinit var translationSuggestionRepository: TranslationSuggestionRepository
+
+  @AfterEach
+  fun resetClock() {
+    clearForcedDate()
+    if (this::testData.isInitialized) {
+      testDataService.cleanTestData(testData.root)
+    }
+  }
+
+  private fun assertSuggestionExists(suggestionId: Long) {
+    executeInNewTransaction {
+      translationSuggestionRepository
+        .findById(suggestionId)
+        .isPresent.assert
+        .isTrue()
+    }
+  }
+
+  private fun assertSuggestionDeleted(suggestionId: Long) {
+    executeInNewTransaction {
+      translationSuggestionRepository
+        .findById(suggestionId)
+        .isPresent.assert
+        .isFalse()
+    }
+  }
+
+  private fun assertSuggestionState(
+    suggestionId: Long,
+    state: TranslationSuggestionState,
+  ) {
+    executeInNewTransaction {
+      translationSuggestionRepository
+        .findById(suggestionId)
+        .get()
+        .state.assert
+        .isEqualTo(state)
+    }
+  }
+
+  fun initTestData(suggestionsMode: SuggestionsMode = SuggestionsMode.ENABLED) {
+    testData = SuggestionsTestData(suggestionsMode)
+    projectSupplier = { testData.relatedProject.self }
+    testDataService.saveTestData(testData.root)
+    userAccount = testData.projectReviewer.self
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `returns list of suggestions`() {
+    initTestData()
+    performProjectAuthGet("languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion")
+      .andAssertThatJson {
+        node("_embedded.suggestions") {
+          node("[0].translation").isEqualTo("Navržený překlad 0-1")
+          node("[0].author.username").isEqualTo("")
+          node("[0].author.name").isEqualTo("Project translator")
+        }
+        node("_embedded.suggestions") {
+          node("[1].translation").isEqualTo("Navržený překlad 0-2")
+          node("[1].author.username").isEqualTo("")
+          node("[1].author.name").isEqualTo("Project reviewer")
+        }
+        node("page.totalElements").isNumber.isEqualTo(BigDecimal(2))
+      }
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `embeds up to MAX_DISPLAYED_SUGGESTIONS newest suggestions per cell in the translations view`() {
+    initTestData()
+    val manyKey = testData.keys[2].self
+    val oneKey = testData.keys[3].self
+    val twoKey = testData.keys[0].self
+    performProjectAuthGet(
+      "/translations?sort=id" +
+        "&filterKeyId=${twoKey.id}&filterKeyId=${manyKey.id}&filterKeyId=${oneKey.id}",
+    ).andIsOk
+      .andAssertThatJson {
+        node("_embedded.keys[1].translations.cs") {
+          node("suggestions").isArray.hasSize(3)
+          node("suggestions[0].translation").isEqualTo("Many suggestion 2-4")
+          node("suggestions[1].translation").isEqualTo("Many suggestion 2-3")
+          node("suggestions[2].translation").isEqualTo("Many suggestion 2-2")
+          node("activeSuggestionCount").isNumber.isEqualTo(BigDecimal(4))
+        }
+        node("_embedded.keys[2].translations.cs") {
+          node("suggestions").isArray.hasSize(1)
+          node("suggestions[0].translation").isEqualTo("Only suggestion 3-1")
+          node("activeSuggestionCount").isNumber.isEqualTo(BigDecimal(1))
+        }
+        node("_embedded.keys[0].translations.cs") {
+          node("suggestions").isArray.hasSize(2)
+          node("activeSuggestionCount").isNumber.isEqualTo(BigDecimal(2))
+        }
+        node("_embedded.keys[0].translations.en") {
+          node("suggestions").isArray.hasSize(2)
+          node("activeSuggestionCount").isNumber.isEqualTo(BigDecimal(2))
+        }
+      }
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `breaks createdAt ties by id desc in the embed`() {
+    initTestData()
+    val key = testData.keys[1].self
+    // both suggestions share one forced createdAt, so only the id desc tiebreaker can order them
+    setForcedDate(currentDateProvider.date)
+    performProjectAuthPost(
+      "languages/${testData.czechLanguage.id}/key/${key.id}/suggestion",
+      CreateTranslationSuggestionRequest(translation = "cs lower id"),
+    ).andIsOk
+    performProjectAuthPost(
+      "languages/${testData.czechLanguage.id}/key/${key.id}/suggestion",
+      CreateTranslationSuggestionRequest(translation = "cs higher id"),
+    ).andIsOk
+
+    performProjectAuthGet("/translations?sort=id&filterKeyId=${key.id}")
+      .andIsOk
+      .andAssertThatJson {
+        node("_embedded.keys[0].translations.cs.suggestions") {
+          isArray.hasSize(2)
+          node("[0].translation").isEqualTo("cs higher id")
+          node("[1].translation").isEqualTo("cs lower id")
+        }
+      }
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `embeds suggestions ordered by createdAt desc, not by id`() {
+    initTestData()
+    val key = testData.keys[1].self
+    val base = currentDateProvider.date.time
+
+    fun createAt(
+      offsetMillis: Long,
+      translation: String,
+    ) {
+      setForcedDate(Date(base + offsetMillis))
+      performProjectAuthPost(
+        "languages/${testData.czechLanguage.id}/key/${key.id}/suggestion",
+        CreateTranslationSuggestionRequest(translation = translation),
+      ).andIsOk
+    }
+
+    createAt(0, "cs oldest")
+    createAt(120_000, "cs newest")
+    createAt(60_000, "cs middle")
+
+    performProjectAuthGet("/translations?sort=id&filterKeyId=${key.id}")
+      .andIsOk
+      .andAssertThatJson {
+        node("_embedded.keys[0].translations.cs.suggestions") {
+          isArray.hasSize(3)
+          node("[0].translation").isEqualTo("cs newest")
+          node("[1].translation").isEqualTo("cs middle")
+          node("[2].translation").isEqualTo("cs oldest")
+        }
+      }
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `creates suggestion`() {
+    initTestData()
+    performProjectAuthPost(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion",
+      CreateTranslationSuggestionRequest(
+        translation = "New suggestion",
+      ),
+    ).andIsOk.andAssertThatJson {
+      node("translation").isEqualTo("New suggestion")
+    }
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `refuses plain suggestion on plural key`() {
+    initTestData()
+    performProjectAuthPost(
+      "languages/${testData.czechLanguage.id}/key/${testData.pluralKey.self.id}/suggestion",
+      CreateTranslationSuggestionRequest(
+        translation = "New suggestion",
+      ),
+    ).andIsBadRequest.andAssertThatJson {
+      node("code").isEqualTo("invalid_plural_form")
+    }
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `accepts suggestion`() {
+    initTestData()
+    performProjectAuthPut(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/${testData.translatorsCzechSuggestion.self.id}/accept",
+    ).andAssertThatJson {
+      node("accepted") {
+        node("translation").isEqualTo("Navržený překlad 0-1")
+        node("author.username").isEqualTo("")
+        node("state").isEqualTo("ACCEPTED")
+      }
+      node("declined").isArray.hasSize(0)
+    }
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `can't accept plain suggestion on plural key`() {
+    initTestData()
+    userAccount = testData.user
+    val firstKey = testData.keys[0].self
+    performProjectAuthPut(
+      "keys/${firstKey.id}/complex-update",
+      ComplexEditKeyDto(
+        name = firstKey.name,
+        isPlural = true,
+      ),
+    ).andIsOk
+    performProjectAuthPut(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/${testData.translatorsCzechSuggestion.self.id}/accept",
+    ).andIsBadRequest
+      .andAssertThatJson {
+        node("code").isEqualTo("suggestion_must_be_plural")
+      }
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `can't accept plural suggestion on plain key`() {
+    initTestData()
+    userAccount = testData.user
+    val pluralKey = testData.pluralKey.self
+    performProjectAuthPut(
+      "keys/${pluralKey.id}/complex-update",
+      ComplexEditKeyDto(
+        name = pluralKey.name,
+        isPlural = false,
+      ),
+    ).andIsOk
+
+    performProjectAuthPut(
+      "languages/${testData.czechLanguage.id}/key/${pluralKey.id}/suggestion/${testData.pluralSuggestion.self.id}/accept",
+    ).andIsBadRequest
+      .andAssertThatJson {
+        node("code").isEqualTo("suggestion_cant_be_plural")
+      }
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `accepts suggestion and declines other`() {
+    initTestData()
+    performProjectAuthPut(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/${testData.translatorsCzechSuggestion.self.id}/accept?declineOther=true",
+    ).andAssertThatJson {
+      node("accepted") {
+        node("translation").isEqualTo("Navržený překlad 0-1")
+        node("author.username").isEqualTo("")
+        node("state").isEqualTo("ACCEPTED")
+      }
+      node("declined[0]").isEqualTo(testData.reviewersCzechSuggestion.self.id)
+      node("declined").isArray.hasSize(1)
+    }
+    assertSuggestionState(testData.translatorsCzechSuggestion.self.id, TranslationSuggestionState.ACCEPTED)
+    assertSuggestionState(testData.reviewersCzechSuggestion.self.id, TranslationSuggestionState.DECLINED)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `accepts suggestion and keeps the reviewed state`() {
+    initTestData()
+    val firstKey = testData.keys[0].self
+    performProjectAuthPut(
+      "languages/${testData.czechLanguage.id}/key/${firstKey.id}/suggestion/${testData.translatorsCzechSuggestion.self.id}/accept",
+    ).andIsOk
+    performProjectAuthGet("/translations?sort=id&filterKeyId=${firstKey.id}")
+      .andIsOk
+      .andAssertThatJson {
+        node("_embedded.keys[0].translations.cs") {
+          node("text").isEqualTo("Navržený překlad 0-1")
+          node("state").isEqualTo("REVIEWED")
+        }
+      }
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `translator cannot accept`() {
+    initTestData()
+    userAccount = testData.projectTranslator.self
+    performProjectAuthPut(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/${testData.translatorsCzechSuggestion.self.id}/accept",
+    ).andIsForbidden
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `can delete his own suggestion`() {
+    initTestData()
+    userAccount = testData.projectTranslator.self
+    val suggestionId = testData.translatorsCzechSuggestion.self.id
+    performProjectAuthDelete(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsOk
+    assertSuggestionDeleted(suggestionId)
+  }
+
+  @Test
+  @ProjectApiKeyAuthTestMethod(scopes = [Scope.TRANSLATIONS_VIEW])
+  fun `a key without suggestions own-access cannot delete its owner's suggestion`() {
+    initTestData()
+    userAccount = testData.projectTranslator.self
+    val suggestionId = testData.translatorsCzechSuggestion.self.id
+    performProjectAuthDelete(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsForbidden.andAssertThatJson {
+      node("code").isEqualTo(Message.OPERATION_NOT_PERMITTED.code)
+      node("params[0]").isEqualTo(Scope.TRANSLATION_SUGGESTIONS_OWN_ACCESS.value)
+    }
+    assertSuggestionExists(suggestionId)
+  }
+
+  @Test
+  @ProjectApiKeyAuthTestMethod(scopes = [Scope.TRANSLATIONS_VIEW, Scope.TRANSLATION_SUGGESTIONS_OWN_ACCESS])
+  fun `a key carrying suggestions own-access can delete its owner's suggestion`() {
+    initTestData()
+    userAccount = testData.projectTranslator.self
+    val suggestionId = testData.translatorsCzechSuggestion.self.id
+    performProjectAuthDelete(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsOk
+    assertSuggestionDeleted(suggestionId)
+  }
+
+  @Test
+  @ProjectApiKeyAuthTestMethod(scopes = [Scope.TRANSLATIONS_VIEW, Scope.TRANSLATION_SUGGESTIONS_OWN_ACCESS])
+  fun `suggestions own-access does not reach another user's suggestion`() {
+    initTestData()
+    userAccount = testData.projectTranslator.self
+    val suggestionId = testData.reviewersCzechSuggestion.self.id
+    performProjectAuthDelete(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsForbidden.andHasErrorMessage(Message.USER_CAN_ONLY_DELETE_HIS_SUGGESTIONS)
+    assertSuggestionExists(suggestionId)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `suggestions-manage covers the holder's own suggestion without own-access being granted`() {
+    initTestData()
+    userAccount = testData.projectEditor.self
+    val suggestionPath = "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion"
+    val suggestionId =
+      performProjectAuthPost(suggestionPath, CreateTranslationSuggestionRequest(translation = "Editor's suggestion"))
+        .andIsOk
+        .getIdFromResponse()
+
+    performProjectAuthDelete("$suggestionPath/$suggestionId").andIsOk
+    assertSuggestionDeleted(suggestionId)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `refuses to create a suggestion when suggestions are disabled`() {
+    initTestData(SuggestionsMode.DISABLED)
+    performProjectAuthPost(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion",
+      CreateTranslationSuggestionRequest(translation = "New suggestion"),
+    ).andIsConflict.andHasErrorMessage(Message.SUGGESTIONS_DISABLED)
+  }
+
+  @Test
+  @ProjectApiKeyAuthTestMethod(scopes = [Scope.TRANSLATIONS_VIEW, Scope.TRANSLATIONS_SUGGEST])
+  fun `refuses to create a suggestion when suggestions are disabled, for an API key too`() {
+    initTestData(SuggestionsMode.DISABLED)
+    performProjectAuthPost(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion",
+      CreateTranslationSuggestionRequest(translation = "New suggestion"),
+    ).andIsConflict.andHasErrorMessage(Message.SUGGESTIONS_DISABLED)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `pending suggestions can still be listed, declined and accepted when suggestions are disabled`() {
+    initTestData(SuggestionsMode.DISABLED)
+    val suggestionPath = "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion"
+    performProjectAuthGet(suggestionPath).andIsOk
+    performProjectAuthPut("$suggestionPath/${testData.reviewersCzechSuggestion.self.id}/decline").andIsOk
+    performProjectAuthPut("$suggestionPath/${testData.translatorsCzechSuggestion.self.id}/accept").andIsOk
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `can still delete his own suggestion when suggestions are disabled`() {
+    initTestData(SuggestionsMode.DISABLED)
+    userAccount = testData.projectTranslator.self
+    val suggestionId = testData.translatorsCzechSuggestion.self.id
+    performProjectAuthDelete(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsOk
+    assertSuggestionDeleted(suggestionId)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `can't delete suggestion of someone else`() {
+    initTestData()
+    userAccount = testData.projectTranslator.self
+    val suggestionId = testData.reviewersCzechSuggestion.self.id
+    performProjectAuthDelete(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsForbidden.andHasErrorMessage(Message.USER_CAN_ONLY_DELETE_HIS_SUGGESTIONS)
+    assertSuggestionExists(suggestionId)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `moderator with suggestions-manage scope can delete another user's suggestion`() {
+    initTestData()
+    userAccount = testData.suggestionModerator.self
+    val suggestionId = testData.reviewersCzechSuggestion.self.id
+    performProjectAuthDelete(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsOk
+    assertSuggestionDeleted(suggestionId)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `granular suggestions-manage permission can list suggestions`() {
+    initTestData()
+    userAccount = testData.suggestionModerator.self
+    performProjectAuthGet(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion",
+    ).andIsOk.andAssertThatJson {
+      node("page.totalElements").isNumber.isEqualTo(BigDecimal(2))
+    }
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `view-only member cannot list suggestions`() {
+    initTestData()
+    userAccount = testData.viewOnlyUser.self
+    performProjectAuthGet(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion",
+    ).andIsForbidden
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `suggester without manage scope can list suggestions in permitted language`() {
+    initTestData()
+    userAccount = testData.czechTranslator.self
+    performProjectAuthGet(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion",
+    ).andIsOk
+    performProjectAuthGet(
+      "languages/${testData.englishLanguage.id}/key/${testData.keys[0].self.id}/suggestion",
+    ).andIsForbidden
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `language-restricted moderator lists suggestions only in permitted language`() {
+    initTestData()
+    userAccount = testData.czechSuggestionModerator.self
+    performProjectAuthGet(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion",
+    ).andIsOk.andAssertThatJson {
+      node("page.totalElements").isNumber.isEqualTo(BigDecimal(2))
+    }
+    performProjectAuthGet(
+      "languages/${testData.englishLanguage.id}/key/${testData.keys[0].self.id}/suggestion",
+    ).andIsForbidden
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `EDIT preset member can delete another user's suggestion`() {
+    initTestData()
+    userAccount = testData.projectEditor.self
+    val suggestionId = testData.translatorsCzechSuggestion.self.id
+    performProjectAuthDelete(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsOk
+    assertSuggestionDeleted(suggestionId)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `unrestricted moderator can delete another user's suggestion in any language`() {
+    initTestData()
+    userAccount = testData.suggestionModerator.self
+    val suggestionId = testData.englishSuggestions[0].self.id
+    performProjectAuthDelete(
+      "languages/${testData.englishLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsOk
+    assertSuggestionDeleted(suggestionId)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `reviewer without suggestions-manage scope cannot delete another user's suggestion`() {
+    initTestData()
+    userAccount = testData.projectReviewer.self
+    val suggestionId = testData.translatorsCzechSuggestion.self.id
+    performProjectAuthDelete(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsForbidden.andHasErrorMessage(Message.USER_CAN_ONLY_DELETE_HIS_SUGGESTIONS)
+    assertSuggestionExists(suggestionId)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `server admin can delete another user's suggestion in any language`() {
+    initTestData()
+    userAccount = testData.serverAdmin.self
+    val suggestionId = testData.englishSuggestions[1].self.id
+    performProjectAuthDelete(
+      "languages/${testData.englishLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsOk
+    assertSuggestionDeleted(suggestionId)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `language-restricted moderator can delete suggestion in a permitted language`() {
+    initTestData()
+    userAccount = testData.czechSuggestionModerator.self
+    val suggestionId = testData.translatorsCzechSuggestion.self.id
+    performProjectAuthDelete(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsOk
+    assertSuggestionDeleted(suggestionId)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `language-restricted moderator cannot delete suggestion in another language`() {
+    initTestData()
+    userAccount = testData.czechSuggestionModerator.self
+    val suggestionId = testData.englishSuggestions[0].self.id
+    performProjectAuthDelete(
+      "languages/${testData.englishLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$suggestionId",
+    ).andIsForbidden.andHasErrorMessage(Message.LANGUAGE_NOT_PERMITTED)
+    assertSuggestionExists(suggestionId)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `author can delete own suggestion even in a non-permitted language`() {
+    initTestData()
+    userAccount = testData.czechReviewer.self
+    val suggestionId = testData.czechReviewerEnglishSuggestion.self.id
+    performProjectAuthDelete(
+      "languages/${testData.englishLanguage.id}/key/${testData.keys[3].self.id}/suggestion/$suggestionId",
+    ).andIsOk
+    assertSuggestionDeleted(suggestionId)
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `czech reviewer can accept czech suggestion`() {
+    initTestData()
+    userAccount = testData.czechReviewer.self
+    performProjectAuthPut(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/${testData.translatorsCzechSuggestion.self.id}/accept",
+    ).andIsOk
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `czech reviewer can't accept english suggestion`() {
+    initTestData()
+    userAccount = testData.czechReviewer.self
+    performProjectAuthPut(
+      "languages/${testData.englishLanguage.id}/key/${testData.keys[0].self.id}/suggestion/${testData.englishSuggestions[0].self.id}/accept",
+    ).andIsForbidden
+  }
+
+  @Test()
+  @ProjectJWTAuthTestMethod
+  fun `czech translator can create czech suggestion`() {
+    initTestData()
+    userAccount = testData.czechTranslator.self
+    performProjectAuthPost(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion",
+      CreateTranslationSuggestionRequest("Nový návrh překladu"),
+    ).andAssertThatJson {
+      node("translation").isEqualTo("Nový návrh překladu")
+      node("state").isEqualTo("ACTIVE")
+    }
+  }
+
+  @Test()
+  @ProjectJWTAuthTestMethod
+  fun `czech translator can't create english suggestion`() {
+    initTestData()
+    userAccount = testData.czechTranslator.self
+    performProjectAuthPost(
+      "languages/${testData.englishLanguage.id}/key/${testData.keys[0].self.id}/suggestion",
+      CreateTranslationSuggestionRequest("New translation suggestion"),
+    ).andIsForbidden
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `cannot accept, decline or set-active a suggestion of another project`() {
+    initTestData()
+    // projectReviewer has REVIEW on the related project (project A); the suggestion belongs to project B
+    val foreignSuggestionId = testData.unrelatedSuggestion.self.id
+    val basePath =
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$foreignSuggestionId"
+
+    performProjectAuthPut("$basePath/accept").andIsNotFound
+    performProjectAuthPut("$basePath/decline").andIsNotFound
+    performProjectAuthPut("$basePath/set-active").andIsNotFound
+
+    // the foreign suggestion's state must remain ACTIVE (not accepted/declined)
+    executeInNewTransaction {
+      val suggestion = translationSuggestionRepository.findById(foreignSuggestionId).get()
+      suggestion.state.assert.isEqualTo(TranslationSuggestionState.ACTIVE)
+    }
+
+    // no suggested translation must be copied into project A's czech translation
+    performProjectAuthGet("/translations?sort=id&filterKeyId=${testData.keys[0].self.id}")
+      .andIsOk
+      .andAssertThatJson {
+        node("_embedded.keys[0].translations.cs.text").isEqualTo("Překlad 0")
+      }
+  }
+
+  @Test
+  @ProjectJWTAuthTestMethod
+  fun `cannot delete a suggestion of another project`() {
+    initTestData()
+    val foreignSuggestionId = testData.unrelatedSuggestion.self.id
+    performProjectAuthDelete(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/$foreignSuggestionId",
+    ).andIsNotFound
+
+    executeInNewTransaction {
+      translationSuggestionRepository
+        .findById(foreignSuggestionId)
+        .isPresent.assert
+        .isTrue()
+    }
+  }
+
+  @Test()
+  @ProjectJWTAuthTestMethod
+  fun `czech translator can't accept any suggestion`() {
+    initTestData()
+    userAccount = testData.czechTranslator.self
+    performProjectAuthPut(
+      "languages/${testData.englishLanguage.id}/key/${testData.keys[0].self.id}/suggestion/${testData.englishSuggestions[0].self.id}/accept",
+    ).andIsForbidden
+    performProjectAuthPut(
+      "languages/${testData.czechLanguage.id}/key/${testData.keys[0].self.id}/suggestion/${testData.translatorsCzechSuggestion.self.id}/accept",
+    ).andIsForbidden
+  }
+}

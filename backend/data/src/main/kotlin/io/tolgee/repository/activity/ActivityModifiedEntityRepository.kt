@@ -1,0 +1,108 @@
+package io.tolgee.repository.activity
+
+import io.tolgee.activity.data.ActivityType
+import io.tolgee.dtos.queryResults.TranslationHistoryView
+import io.tolgee.model.activity.ActivityModifiedEntity
+import io.tolgee.model.activity.ActivityModifiedEntityId
+import org.springframework.context.annotation.Lazy
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.Pageable
+import org.springframework.data.jpa.repository.JpaRepository
+import org.springframework.data.jpa.repository.Query
+import org.springframework.stereotype.Repository
+
+@Repository
+@Lazy
+interface ActivityModifiedEntityRepository : JpaRepository<ActivityModifiedEntity, ActivityModifiedEntityId> {
+  @Query(
+    """
+    select ame.modifications as modifications, ar.timestamp as timestamp,
+    u.name as authorName, u.avatarHash as authorAvatarHash, u.username as authorEmail,
+    u.id as authorId, u.deletedAt as authorDeletedAt, ame.revisionType as revisionType
+    from ActivityModifiedEntity ame 
+    join ame.activityRevision ar
+    join UserAccount u on ar.authorId = u.id
+    where ame.entityClass = 'Translation' and ame.entityId = :translationId
+    and ar.type not in :ignoredActivityTypes
+  """,
+  )
+  fun getTranslationHistory(
+    translationId: Long,
+    pageable: Pageable,
+    ignoredActivityTypes: List<ActivityType>,
+  ): Page<TranslationHistoryView>
+
+  @Query(
+    """
+    select case when count(ame) > 0 then true else false end
+    from ActivityModifiedEntity ame
+    where ame.activityRevision.id = :revisionId and ame.branchId = :branchId
+    """,
+  )
+  fun hasModifiedEntitiesOnBranch(
+    revisionId: Long,
+    branchId: Long,
+  ): Boolean
+
+  @Query(
+    """
+      select ame from ActivityModifiedEntity ame
+        left join Branch b on ame.branchId = b.id
+        where ame.activityRevision.projectId = :projectId 
+        and ame.activityRevision.id in :revisionIds
+        and cast(empty_json(ame.modifications) as boolean) = false 
+        and (:filterEntityClass is null or ame.entityClass in :filterEntityClass)
+        and ((b.id = :branchId and b.deletedAt is null) or (:branchId is null and (b is null or b.isDefault)))
+        order by ame.activityRevision.id, ame.entityClass, ame.entityId
+    """,
+  )
+  fun getModifiedEntities(
+    projectId: Long,
+    revisionIds: List<Long>,
+    filterEntityClass: List<String>?,
+    pageable: Pageable,
+    branchId: Long? = null,
+  ): Page<ActivityModifiedEntity>
+
+  @Query(
+    """
+    from ActivityModifiedEntity ame
+    where ame.activityRevision.id = :revisionId
+    """,
+  )
+  fun findByRevisionId(revisionId: Long): List<ActivityModifiedEntity>
+
+  @Query(
+    """
+    select count(distinct t.key.id)
+    from ActivityModifiedEntity ame
+      join Translation t on t.id = ame.entityId
+      left join Branch b on ame.branchId = b.id
+    where ame.activityRevision.id = :revisionId
+      and ame.entityClass = 'Translation'
+      and (
+        cast(jsonb_exists(ame.modifications, 'text') as boolean) = true
+        or cast(jsonb_exists(ame.modifications, 'state') as boolean) = true
+      )
+      and (b is null or b.isDefault)
+    """,
+  )
+  fun countModifiedTranslationKeys(revisionId: Long): Long
+
+  @Query(
+    """
+    select distinct t.language.tag
+    from ActivityModifiedEntity ame
+      join Translation t on t.id = ame.entityId
+      left join Branch b on ame.branchId = b.id
+    where ame.activityRevision.id = :revisionId
+      and ame.entityClass = 'Translation'
+      and (
+        cast(jsonb_exists(ame.modifications, 'text') as boolean) = true
+        or cast(jsonb_exists(ame.modifications, 'state') as boolean) = true
+      )
+      and (b is null or b.isDefault)
+    """,
+  )
+  fun findModifiedTranslationLanguageTags(revisionId: Long): List<String>
+}

@@ -1,0 +1,199 @@
+package io.tolgee
+
+import io.modelcontextprotocol.client.McpClient
+import io.modelcontextprotocol.client.McpSyncClient
+import io.modelcontextprotocol.client.transport.HttpClientStreamableHttpTransport
+import io.modelcontextprotocol.spec.McpSchema
+import io.tolgee.development.testDataBuilder.data.BaseTestData
+import io.tolgee.model.ApiKey
+import io.tolgee.model.Pat
+import io.tolgee.model.enums.Scope
+import io.tolgee.testing.assertions.Assertions.assertThat
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.TestInstance
+import org.springframework.boot.test.context.SpringBootTest
+import org.springframework.boot.test.web.server.LocalServerPort
+import org.springframework.test.context.TestPropertySource
+import tools.jackson.databind.JsonNode
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
+
+// OSIV is disabled to replicate production MCP environment where tool handlers
+// run without an open Hibernate session spanning the request.
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+@TestPropertySource(properties = ["spring.jpa.open-in-view=false"])
+abstract class AbstractMcpTest : AbstractSpringTest() {
+  companion object {
+    const val CREDENTIAL_LESS_TOOLS_CALL =
+      """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_keys","arguments":{}}}"""
+  }
+
+  @LocalServerPort
+  protected val port: Int = 0
+
+  private val clients = mutableListOf<McpSyncClient>()
+
+  fun createMcpClientWithPat(pat: String): McpSyncClient = createMcpClientWithHeader("tgpat_$pat")
+
+  fun createMcpClientWithPak(pak: String): McpSyncClient = createMcpClientWithHeader("tgpak_$pak")
+
+  fun createMcpClientWithoutAuth(): McpSyncClient = createMcpClientWithHeader(null)
+
+  /** One raw JSON-RPC POST, for tests about what the endpoint answers before any MCP session exists. */
+  fun postRawJsonRpc(
+    body: String,
+    query: String = "",
+  ): HttpResponse<String> {
+    val request =
+      HttpRequest
+        .newBuilder(URI.create("http://localhost:$port/mcp/developer$query"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .POST(HttpRequest.BodyPublishers.ofString(body))
+        .build()
+    return HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString())
+  }
+
+  fun createMcpClientWithBearer(accessToken: String): McpSyncClient =
+    createMcpClient { it.header("Authorization", "Bearer $accessToken") }
+
+  private fun createMcpClientWithHeader(apiKeyHeader: String?): McpSyncClient =
+    createMcpClient { builder ->
+      if (apiKeyHeader != null) {
+        builder.header("X-API-Key", apiKeyHeader)
+      }
+    }
+
+  private fun createMcpClient(customizeRequest: (HttpRequest.Builder) -> Unit): McpSyncClient {
+    val transport =
+      HttpClientStreamableHttpTransport
+        .builder("http://localhost:$port")
+        .endpoint("/mcp/developer")
+        .httpRequestCustomizer { builder, _, _, _, _ -> customizeRequest(builder) }
+        .build()
+
+    val client =
+      McpClient
+        .sync(transport)
+        .clientInfo(McpSchema.Implementation("test-client", "1.0"))
+        .requestTimeout(Duration.ofSeconds(10))
+        .build()
+
+    client.initialize()
+    clients.add(client)
+    return client
+  }
+
+  @AfterEach
+  fun closeMcpClients() {
+    clients.forEach {
+      try {
+        it.close()
+      } catch (_: Exception) {
+      }
+    }
+    clients.clear()
+  }
+
+  fun createTestDataWithPat(): McpPatTestData {
+    var pat: Pat? = null
+    val base = BaseTestData()
+    base.userAccountBuilder.build {
+      addPat {
+        description = "MCP test PAT"
+        pat = this
+      }
+    }
+    base.projectBuilder.addBranch {
+      name = "main"
+      isDefault = true
+    }
+    testDataService.saveTestData(base.root)
+    return McpPatTestData(
+      testData = base,
+      pat = pat!!,
+      projectId = base.project.id,
+      organizationId = base.projectBuilder.self.organizationOwner.id,
+    )
+  }
+
+  fun createTestDataWithPak(scopes: Set<Scope> = Scope.entries.toSet()): McpPakTestData {
+    var apiKey: ApiKey? = null
+    val base = BaseTestData(userName = "pak_test_user", projectName = "pak_test_project")
+    base.projectBuilder.build {
+      addApiKey {
+        key = "test_pak_key"
+        scopesEnum = scopes.toMutableSet()
+        userAccount = base.userAccountBuilder.self
+        apiKey = this
+      }
+    }
+    base.projectBuilder.addBranch {
+      name = "main"
+      isDefault = true
+    }
+    testDataService.saveTestData(base.root)
+    return McpPakTestData(
+      testData = base,
+      apiKey = apiKey!!,
+      projectId = base.project.id,
+      organizationId = base.projectBuilder.self.organizationOwner.id,
+    )
+  }
+
+  fun callTool(
+    client: McpSyncClient,
+    name: String,
+    arguments: Map<String, Any?> = emptyMap(),
+  ): McpSchema.CallToolResult {
+    return client.callTool(McpSchema.CallToolRequest(name, arguments))
+  }
+
+  fun callToolAndGetJson(
+    client: McpSyncClient,
+    name: String,
+    arguments: Map<String, Any?> = emptyMap(),
+  ): JsonNode {
+    val result = callTool(client, name, arguments)
+    val textContent = result.content().first() as McpSchema.TextContent
+    return objectMapper.readTree(textContent.text())
+  }
+
+  fun assertToolSucceeds(
+    client: McpSyncClient,
+    name: String,
+    arguments: Map<String, Any?> = emptyMap(),
+  ) {
+    val result = callTool(client, name, arguments)
+    assertThat(result.isError).isFalse()
+  }
+
+  fun assertToolFails(
+    client: McpSyncClient,
+    name: String,
+    arguments: Map<String, Any?> = emptyMap(),
+    expectedError: String = "operation_not_permitted",
+  ) {
+    val exception = runCatching { callTool(client, name, arguments) }.exceptionOrNull()
+    assertThat(exception).isNotNull()
+    assertThat(exception!!.toString()).contains(expectedError)
+  }
+
+  data class McpPatTestData(
+    val testData: BaseTestData,
+    val pat: Pat,
+    val projectId: Long,
+    val organizationId: Long,
+  )
+
+  data class McpPakTestData(
+    val testData: BaseTestData,
+    val apiKey: ApiKey,
+    val projectId: Long,
+    val organizationId: Long,
+  )
+}

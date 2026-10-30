@@ -1,0 +1,89 @@
+import { Box, MenuItem } from '@mui/material';
+import { Field, useFormikContext } from 'formik';
+import { components } from 'tg.service/apiSchema.generated';
+
+import { useTranslate } from '@tolgee/react';
+import { FC } from 'react';
+import { TextField } from 'tg.component/common/form/fields/TextField';
+import { Select } from 'tg.component/common/Select';
+import { CdValues } from './getCdEditInitialValues';
+
+type ContentStorageModel = components['schemas']['ContentStorageModel'];
+
+type Props = {
+  items: ContentStorageModel[];
+};
+
+export const CdStorageSelector = ({ items }: Props) => {
+  return (
+    <>
+      <StorageField items={items} />
+      <CustomSlug />
+    </>
+  );
+};
+
+export const CustomSlug = () => {
+  const { t } = useTranslate();
+
+  const field = useFormikContext<CdValues>();
+  const storageId = field.values.contentStorageId;
+
+  if (!storageId) {
+    return null;
+  }
+
+  return (
+    <Box pt={2}>
+      <TextField
+        name="slug"
+        label={t('content_delivery_form_custom_slug_label')}
+        helperText={t('content_delivery_form_custom_slug_helper_text')}
+        placeholder={t(
+          'content_delivery_form_custom_slug_generated_placeholder'
+        )}
+        data-cy="content-delivery-form-custom-slug"
+      />
+    </Box>
+  );
+};
+
+export const StorageField: FC<
+  React.PropsWithChildren<{
+    items: components['schemas']['ContentStorageModel'][];
+  }>
+> = ({ items }) => {
+  const { t } = useTranslate();
+
+  const label = t('content_delivery_form_storage');
+
+  return (
+    <Field name="contentStorageId">
+      {({ field }) => (
+        <Select
+          {...field}
+          label={label}
+          minHeight={false}
+          displayEmpty
+          data-cy="content-delivery-storage-selector"
+        >
+          <MenuItem
+            data-cy="content-delivery-storage-selector-item"
+            value={undefined}
+          >
+            {t('storage_item_default')}
+          </MenuItem>
+          {items.map((item) => (
+            <MenuItem
+              key={item.id}
+              value={item.id}
+              data-cy="content-delivery-storage-selector-item"
+            >
+              {item.name}
+            </MenuItem>
+          ))}
+        </Select>
+      )}
+    </Field>
+  );
+};

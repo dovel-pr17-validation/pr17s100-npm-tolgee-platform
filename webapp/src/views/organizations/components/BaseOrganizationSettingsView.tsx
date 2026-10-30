@@ -1,0 +1,163 @@
+import { useHistory, useRouteMatch } from 'react-router-dom';
+
+import { BaseViewProps } from 'tg.component/layout/BaseView';
+import { Link, LINKS, PARAMS } from 'tg.constants/links';
+import { useApiQuery } from 'tg.service/http/useQueryApi';
+
+import { components } from 'tg.service/apiSchema.generated';
+import { OrganizationSwitch } from 'tg.component/organizationSwitch/OrganizationSwitch';
+import { NavigationItem } from 'tg.component/navigation/Navigation';
+import { useTranslate } from '@tolgee/react';
+import { BaseSettingsView } from 'tg.component/layout/BaseSettingsView/BaseSettingsView';
+import { SettingsMenuItem } from 'tg.component/layout/BaseSettingsView/SettingsMenu';
+import {
+  useConfig,
+  useIsAdminOrSupporter,
+  usePreferredOrganization,
+} from 'tg.globalContext/helpers';
+import { CriticalUsageCircle } from 'tg.ee';
+import { isAtLeastMemberOrgRole } from 'tg.fixtures/organizationRole';
+
+type OrganizationModel = components['schemas']['OrganizationModel'];
+
+type Props = BaseViewProps & {
+  link: Link;
+};
+
+export const BaseOrganizationSettingsView: React.FC<
+  React.PropsWithChildren<Props>
+> = ({ children, loading, navigation, link, ...otherProps }) => {
+  const config = useConfig();
+  const match = useRouteMatch();
+  const organizationSlug = match.params[PARAMS.ORGANIZATION_SLUG];
+  const { t } = useTranslate();
+  const history = useHistory();
+  const { preferredOrganization } = usePreferredOrganization();
+  const isAdminOrSupporter = useIsAdminOrSupporter();
+
+  const handleOrganizationSelect = (organization: OrganizationModel) => {
+    const redirectLink =
+      organization.currentUserRole === 'OWNER'
+        ? link
+        : LINKS.ORGANIZATION_PROFILE;
+
+    history.push(
+      redirectLink.build({ [PARAMS.ORGANIZATION_SLUG]: organization.slug })
+    );
+  };
+
+  const canManageOrganization =
+    preferredOrganization?.currentUserRole === 'OWNER' || isAdminOrSupporter;
+
+  const menuItems: SettingsMenuItem[] = [
+    {
+      link: LINKS.ORGANIZATION_PROFILE.build({
+        [PARAMS.ORGANIZATION_SLUG]: organizationSlug,
+      }),
+      label: t('organization_menu_profile'),
+      'data-cy': 'profile',
+    },
+  ];
+
+  if (canManageOrganization) {
+    menuItems.push({
+      link: LINKS.ORGANIZATION_MEMBERS.build({
+        [PARAMS.ORGANIZATION_SLUG]: organizationSlug,
+      }),
+      label: t('organization_menu_members'),
+    });
+    menuItems.push({
+      link: LINKS.ORGANIZATION_MEMBER_PRIVILEGES.build({
+        [PARAMS.ORGANIZATION_SLUG]: organizationSlug,
+      }),
+      label: t('organization_menu_member_privileges'),
+    });
+  }
+
+  menuItems.push({
+    link: LINKS.ORGANIZATION_GLOSSARIES.build({
+      [PARAMS.ORGANIZATION_SLUG]: organizationSlug,
+    }),
+    label: t('organization_menu_glossaries'),
+    'data-cy': 'glossaries',
+  });
+
+  // hide the link; below-MEMBER users would hit a 403 on the TM endpoints
+  if (
+    isAtLeastMemberOrgRole(preferredOrganization?.currentUserRole) ||
+    isAdminOrSupporter
+  ) {
+    menuItems.push({
+      link: LINKS.ORGANIZATION_TRANSLATION_MEMORIES.build({
+        [PARAMS.ORGANIZATION_SLUG]: organizationSlug,
+      }),
+      label: t(
+        'organization_menu_translation_memories',
+        'Translation memories'
+      ),
+      'data-cy': 'translation-memories',
+    });
+  }
+
+  if (canManageOrganization) {
+    menuItems.push({
+      link: LINKS.ORGANIZATION_APPS.build({
+        [PARAMS.ORGANIZATION_SLUG]: organizationSlug,
+      }),
+      label: t('organization_menu_apps'),
+    });
+    if (config.llm.enabled) {
+      menuItems.push({
+        link: LINKS.ORGANIZATION_LLM_PROVIDERS.build({
+          [PARAMS.ORGANIZATION_SLUG]: organizationSlug,
+        }),
+        label: t('organization_menu_llm_providers'),
+      });
+    }
+    menuItems.push({
+      link: LINKS.ORGANIZATION_SSO.build({
+        [PARAMS.ORGANIZATION_SLUG]: organizationSlug,
+      }),
+      label: t('organization_menu_sso_login'),
+    });
+    if (config.billing.enabled) {
+      menuItems.push({
+        link: LINKS.ORGANIZATION_BILLING.build({
+          [PARAMS.ORGANIZATION_SLUG]: organizationSlug,
+        }),
+        label: t('organization_menu_billing', 'Billing'),
+      });
+      if (config.testClockEnabled && isAdminOrSupporter) {
+        menuItems.push({
+          link: LINKS.ORGANIZATION_BILLING_TEST_CLOCK_HELPER.build({
+            [PARAMS.ORGANIZATION_SLUG]: organizationSlug,
+          }),
+          label: t('organization-menu-billing-test-clock'),
+        });
+      }
+    }
+  }
+
+  const organizationLoadable = useApiQuery({
+    url: '/v2/organizations/{slug}',
+    method: 'get',
+    path: { slug: organizationSlug },
+  });
+
+  const navigationPrefix: NavigationItem[] = organizationLoadable.data
+    ? [[<OrganizationSwitch key={0} onSelect={handleOrganizationSelect} />]]
+    : [];
+
+  return (
+    <BaseSettingsView
+      {...otherProps}
+      loading={organizationLoadable.isLoading || loading}
+      navigation={[...navigationPrefix, ...(navigation || [])]}
+      navigationRight={<CriticalUsageCircle />}
+      menuItems={menuItems}
+      hideChildrenOnLoading={false}
+    >
+      {children}
+    </BaseSettingsView>
+  );
+};
